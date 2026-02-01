@@ -22,7 +22,7 @@ wget -N --no-check-certificate https://raw.githubusercontent.com/Aki1106-0116/hy
 * 新版：默认改为 String 模式（返回 403 Forbidden）。模拟 Nginx 静态服务器拒绝访问，性能开销极低，隐蔽性更好。
 
 2. 默认开启端口跳跃 ：
-* 默认引导用户配置端口跳跃（不仅是单端口），并自动处理 iptables/ip6tables 转发规则。
+* 默认引导用户配置端口跳跃，并自动处理 iptables/ip6tables 转发规则。
 * 将默认跳跃间隔调整为 25秒，有效对抗运营商的针对性阻断和 QoS 限速。
 
 3. 服务端限速保护：
