@@ -76,7 +76,6 @@ install_iptables_persistent(){
 }
 
 inst_cert(){
-    # [关键修复] 统一将证书存放在 /etc/hysteria 目录下，解决 Permission denied 问题
     mkdir -p /etc/hysteria
 
     green "请选择 Hysteria 2 协议的证书申请方式："
@@ -100,11 +99,9 @@ inst_cert(){
     read -rp "请输入选项 [1-3]: " certInput
     
     if [[ $certInput == 2 ]]; then
-        # 路径改为标准目录
         cert_path="/etc/hysteria/cert.crt"
         key_path="/etc/hysteria/private.key"
 
-        # 检查是否已存在证书
         if [[ -f $cert_path && -f $key_path && -s $cert_path && -s $key_path ]] && [[ -f /root/ca.log ]]; then
             domain=$(cat /root/ca.log)
             green "检测到原有域名：$domain 的证书，正在应用"
@@ -148,18 +145,14 @@ inst_cert(){
                 bash ~/.acme.sh/acme.sh --issue -d ${domain} --standalone -k ec-256 --insecure
             fi
             
-            # 安装证书到 /etc/hysteria 目录
             bash ~/.acme.sh/acme.sh --install-cert -d ${domain} --key-file /etc/hysteria/private.key --fullchain-file /etc/hysteria/cert.crt --ecc
             
             if [[ -f /etc/hysteria/cert.crt && -f /etc/hysteria/private.key ]]; then
                 echo $domain > /root/ca.log
                 sed -i '/--cron/d' /etc/crontab >/dev/null 2>&1
                 echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
-                
-                # [关键] 修正权限：证书可读，私钥仅所有者可读
                 chmod 644 /etc/hysteria/cert.crt
                 chmod 600 /etc/hysteria/private.key
-                
                 green "证书申请成功!"
                 hy_domain=$domain
             else
@@ -211,9 +204,9 @@ inst_port_config(){
         firstport=""
         endport=""
         
-        # [关键修复] 显式放行主端口，防止防火墙拦截
         iptables -I INPUT -p udp --dport $port -j ACCEPT
         ip6tables -I INPUT -p udp --dport $port -j ACCEPT
+        save_iptables_rules
         
         yellow "Hysteria 2 将运行在单端口：$port"
         
@@ -248,14 +241,11 @@ inst_port_config(){
         
         port=$firstport
         
-        # 应用 DNAT 转发
         iptables -t nat -A PREROUTING -p udp --dport $firstport:$endport -j DNAT --to-destination :$port
         ip6tables -t nat -A PREROUTING -p udp --dport $firstport:$endport -j DNAT --to-destination :$port
         
-        # [关键修复] 显式放行端口范围，防止防火墙拦截
         iptables -I INPUT -p udp --dport $firstport:$endport -j ACCEPT
         ip6tables -I INPUT -p udp --dport $firstport:$endport -j ACCEPT
-        
         save_iptables_rules
         
         yellow "端口跳跃设置完成：$firstport - $endport (主监听端口: $port)"
@@ -318,7 +308,6 @@ inst_bandwidth(){
 generate_config(){
     mkdir -p /etc/hysteria
 
-    # 针对 IPv6 环境优化：监听 [::]:port
     cat << EOF > /etc/hysteria/config.yaml
 listen: "[::]:$port"
 
@@ -449,7 +438,7 @@ EOF
 
 read_current_config(){
     if [[ -f /etc/hysteria/config.yaml ]]; then
-        port=$(grep "^listen:" /etc/hysteria/config.yaml | awk '{print $2}' | sed 's/://g;s/\[//g;s/\]//g')
+        port=$(grep "^listen:" /etc/hysteria/config.yaml | awk '{print $2}' | tr -d '"[]' | awk -F: '{print $NF}')
         cert_path=$(grep "cert:" /etc/hysteria/config.yaml | awk '{print $2}')
         key_path=$(grep "key:" /etc/hysteria/config.yaml | awk '{print $2}')
         auth_pwd=$(grep "password:" /etc/hysteria/config.yaml | awk '{print $2}')
@@ -532,7 +521,6 @@ insthysteria(){
     systemctl daemon-reload
     systemctl enable hysteria-server
     
-    # [关键修复] 等待5秒让 WARP 网络就绪，防止启动过快导致失败
     echo "正在等待网络环境就绪..."
     sleep 5
     systemctl start hysteria-server
