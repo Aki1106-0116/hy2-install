@@ -49,6 +49,32 @@ realip(){
     ip=$(curl -s4m8 ip.sb -k) || ip=$(curl -s6m8 ip.sb -k)
 }
 
+save_iptables_rules(){
+    if [[ $SYSTEM == "CentOS" ]]; then
+        if [[ -f /usr/libexec/iptables/iptables.init ]]; then
+            service iptables save >/dev/null 2>&1
+            service ip6tables save >/dev/null 2>&1
+        else
+            iptables-save > /etc/sysconfig/iptables 2>/dev/null
+            ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null
+        fi
+    else
+        netfilter-persistent save >/dev/null 2>&1
+    fi
+}
+
+install_iptables_persistent(){
+    if [[ $SYSTEM == "CentOS" ]]; then
+        ${PACKAGE_INSTALL[int]} iptables-services
+        systemctl enable iptables >/dev/null 2>&1
+        systemctl enable ip6tables >/dev/null 2>&1
+        systemctl start iptables >/dev/null 2>&1
+        systemctl start ip6tables >/dev/null 2>&1
+    else
+        ${PACKAGE_INSTALL[int]} iptables-persistent netfilter-persistent
+    fi
+}
+
 inst_cert(){
     green "请选择 Hysteria 2 协议的证书申请方式："
     echo ""
@@ -145,8 +171,8 @@ inst_cert(){
         key_path="/etc/hysteria/private.key"
         openssl ecparam -genkey -name prime256v1 -out /etc/hysteria/private.key
         openssl req -new -x509 -days 36500 -key /etc/hysteria/private.key -out /etc/hysteria/cert.crt -subj "/CN=www.bing.com"
-        chmod 777 /etc/hysteria/cert.crt
-        chmod 777 /etc/hysteria/private.key
+        chmod 644 /etc/hysteria/cert.crt
+        chmod 600 /etc/hysteria/private.key
         hy_domain="www.bing.com"
         domain="www.bing.com"
     fi
@@ -154,6 +180,7 @@ inst_cert(){
 
 inst_port_config(){
     iptables -t nat -F PREROUTING >/dev/null 2>&1
+    ip6tables -t nat -F PREROUTING >/dev/null 2>&1
     
     echo ""
     green "请选择端口使用模式："
@@ -199,7 +226,7 @@ inst_port_config(){
         [[ -z $endport ]] && endport=$default_endport
 
         if [[ $firstport -ge $endport ]]; then
-            until [[ $firstport -le $endport ]]; do
+            until [[ $firstport -lt $endport ]]; do
                 red "起始端口必须小于结束端口！"
                 read -p "请重新输入起始端口：" firstport
                 read -p "请重新输入结束端口：" endport
@@ -208,9 +235,9 @@ inst_port_config(){
         
         port=$firstport
         
-        iptables -t nat -A PREROUTING -p udp --dport $firstport:$endport  -j DNAT --to-destination :$port
-        ip6tables -t nat -A PREROUTING -p udp --dport $firstport:$endport  -j DNAT --to-destination :$port
-        netfilter-persistent save >/dev/null 2>&1
+        iptables -t nat -A PREROUTING -p udp --dport $firstport:$endport -j DNAT --to-destination :$port
+        ip6tables -t nat -A PREROUTING -p udp --dport $firstport:$endport -j DNAT --to-destination :$port
+        save_iptables_rules
         
         yellow "端口跳跃设置完成：$firstport - $endport (主监听端口: $port)"
     fi
@@ -243,6 +270,7 @@ inst_site(){
         yellow "Hysteria 2 将伪装成：$proxysite (性能较低)"
     else
         masq_type="string"
+        proxysite=""
         green "Hysteria 2 将使用 403 Forbidden 页面作为伪装 (性能最优)"
     fi
 }
@@ -259,9 +287,11 @@ inst_bandwidth(){
     
     if [[ $bwInput == 2 ]]; then
         limit_bandwidth="no"
+        bandwidth_value=""
         yellow "已选择：不限制带宽"
     else
         limit_bandwidth="yes"
+        bandwidth_value="100"
         yellow "已选择：限制服务端带宽为 100 Mbps (上下行)"
     fi
 }
@@ -291,8 +321,8 @@ EOF
     if [[ $limit_bandwidth == "yes" ]]; then
         cat << EOF >> /etc/hysteria/config.yaml
 bandwidth:
-  up: 100 mbps
-  down: 100 mbps
+  up: ${bandwidth_value:-100} mbps
+  down: ${bandwidth_value:-100} mbps
 
 EOF
     fi
@@ -320,35 +350,9 @@ EOF
     fi
 }
 
-insthysteria(){
-    warpv6=$(curl -s6m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
-    warpv4=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
-    if [[ $warpv4 =~ on|plus || $warpv6 =~ on|plus ]]; then
-        wg-quick down wgcf >/dev/null 2>&1
-        systemctl stop warp-go >/dev/null 2>&1
-        realip
-        systemctl start warp-go >/dev/null 2>&1
-        wg-quick up wgcf >/dev/null 2>&1
-    else
-        realip
-    fi
-
-    if [[ ! ${SYSTEM} == "CentOS" ]]; then
-        ${PACKAGE_UPDATE[int]}
-    fi
-    ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps iptables-persistent netfilter-persistent
-
-    wget -N https://raw.githubusercontent.com/Misaka-blog/hysteria-install/main/hy2/install_server.sh
-    bash install_server.sh
-    rm -f install_server.sh
-
-    inst_cert
-    inst_port_config
-    inst_pwd
-    inst_site
-    inst_bandwidth
-    generate_config
-
+generate_client_config(){
+    realip
+    
     if [[ -n $firstport ]]; then
         server_port_string="$port,$firstport-$endport"
     else
@@ -412,16 +416,99 @@ EOF
 }
 EOF
 
-    url_base="hysteria2://$auth_pwd@$last_ip:$port"
-    url_params="?insecure=1&sni=$hy_domain&mportHopInt=25"
+    # 修正点：加入了 security=tls 和 mportHopInt=25
+    url="hysteria2://${auth_pwd}@${last_ip}:${port}?security=tls&insecure=1&sni=${hy_domain}&mportHopInt=25"
     
     if [[ -n $firstport ]]; then
-        url_params="${url_params}&mport=$firstport-$endport"
+        url="${url}&mport=${firstport}-${endport}"
     fi
     
-    url="${url_base}${url_params}#Hysteria2-misaka"
+    url="${url}#Hysteria2"
     
-    echo $url > /root/hy/url.txt
+    echo "$url" > /root/hy/url.txt
+}
+
+read_current_config(){
+    if [[ -f /etc/hysteria/config.yaml ]]; then
+        port=$(grep "^listen:" /etc/hysteria/config.yaml | awk '{print $2}' | sed 's/://g')
+        cert_path=$(grep "cert:" /etc/hysteria/config.yaml | awk '{print $2}')
+        key_path=$(grep "key:" /etc/hysteria/config.yaml | awk '{print $2}')
+        auth_pwd=$(grep "password:" /etc/hysteria/config.yaml | awk '{print $2}')
+        
+        if grep -q "type: proxy" /etc/hysteria/config.yaml; then
+            masq_type="proxy"
+            proxysite=$(grep "url:" /etc/hysteria/config.yaml | sed 's/.*https:\/\///g' | sed 's/ //g')
+        else
+            masq_type="string"
+            proxysite=""
+        fi
+        
+        if grep -q "bandwidth:" /etc/hysteria/config.yaml; then
+            limit_bandwidth="yes"
+            bandwidth_value=$(grep "up:" /etc/hysteria/config.yaml | head -1 | awk '{print $2}')
+        else
+            limit_bandwidth="no"
+            bandwidth_value=""
+        fi
+        
+        if [[ -f /root/hy/hy-client.yaml ]]; then
+            hy_domain=$(grep "sni:" /root/hy/hy-client.yaml | awk '{print $2}')
+        else
+            hy_domain=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN = //;s/,.*//')
+            [[ -z $hy_domain ]] && hy_domain="www.bing.com"
+        fi
+        
+        port_hop_rule=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep -E "dpts?:[0-9]+" | head -1)
+        if [[ -n $port_hop_rule ]]; then
+            firstport=$(echo "$port_hop_rule" | grep -oP 'dpts:\K[0-9]+' | head -1)
+            endport=$(echo "$port_hop_rule" | grep -oP 'dpts:[0-9]+:\K[0-9]+')
+            if [[ -z $endport ]]; then
+                port_range=$(echo "$port_hop_rule" | grep -oP 'dpt[s]?:[0-9:]+' | sed 's/dpts\?://')
+                firstport=$(echo "$port_range" | cut -d: -f1)
+                endport=$(echo "$port_range" | cut -d: -f2)
+            fi
+        else
+            firstport=""
+            endport=""
+        fi
+        
+        return 0
+    else
+        return 1
+    fi
+}
+
+insthysteria(){
+    warpv6=$(curl -s6m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+    warpv4=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+    if [[ $warpv4 =~ on|plus || $warpv6 =~ on|plus ]]; then
+        wg-quick down wgcf >/dev/null 2>&1
+        systemctl stop warp-go >/dev/null 2>&1
+        realip
+        systemctl start warp-go >/dev/null 2>&1
+        wg-quick up wgcf >/dev/null 2>&1
+    else
+        realip
+    fi
+
+    if [[ ! ${SYSTEM} == "CentOS" ]]; then
+        ${PACKAGE_UPDATE[int]}
+    fi
+    ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps
+    
+    install_iptables_persistent
+
+    wget -N https://raw.githubusercontent.com/Misaka-blog/hysteria-install/main/hy2/install_server.sh
+    bash install_server.sh
+    rm -f install_server.sh
+
+    inst_cert
+    inst_port_config
+    inst_pwd
+    inst_site
+    inst_bandwidth
+    generate_config
+    generate_client_config
 
     systemctl daemon-reload
     systemctl enable hysteria-server
@@ -449,7 +536,7 @@ EOF
     red "$(cat /root/hy/hy-client.yaml)"
     yellow "Hysteria 2 客户端 JSON 配置文件 hy-client.json 内容如下"
     red "$(cat /root/hy/hy-client.json)"
-    yellow "Hysteria 2 节点分享链接如下 (已修复V2Ray导入问题)"
+    yellow "Hysteria 2 节点分享链接如下"
     red "$(cat /root/hy/url.txt)"
 }
 
@@ -460,7 +547,8 @@ unsthysteria(){
     rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy /root/hysteria.sh
     rm -f /usr/bin/hy2
     iptables -t nat -F PREROUTING >/dev/null 2>&1
-    netfilter-persistent save >/dev/null 2>&1
+    ip6tables -t nat -F PREROUTING >/dev/null 2>&1
+    save_iptables_rules
     green "Hysteria 2 已彻底卸载完成！"
 }
 
@@ -491,6 +579,8 @@ hysteriaswitch(){
 }
 
 changebandwidth(){
+    read_current_config
+    
     echo ""
     green "请选择是否开启带宽限速 (推荐开启以防止阻断)："
     echo -e " ${GREEN}1.${PLAIN} 开启 100 Mbps 限制"
@@ -499,143 +589,61 @@ changebandwidth(){
     echo ""
     read -rp "请输入选项 [1-3]: " bwChange
     
-    port=$(grep "listen:" /etc/hysteria/config.yaml | awk '{print $2}' | sed 's/://g')
-    cert_path=$(grep "cert:" /etc/hysteria/config.yaml | awk '{print $2}')
-    key_path=$(grep "key:" /etc/hysteria/config.yaml | awk '{print $2}')
-    auth_pwd=$(grep "password:" /etc/hysteria/config.yaml | awk '{print $2}')
-    
-    if grep -q "type: proxy" /etc/hysteria/config.yaml; then
-        masq_type="proxy"
-        proxysite=$(grep "url:" /etc/hysteria/config.yaml | sed 's/.*https:\/\///g' | sed 's/ //g')
-    else
-        masq_type="string"
-    fi
-
-    cat << EOF > /etc/hysteria/config.yaml
-listen: :$port
-
-tls:
-  cert: $cert_path
-  key: $key_path
-
-quic:
-  initStreamReceiveWindow: 16777216
-  maxStreamReceiveWindow: 16777216
-  initConnReceiveWindow: 33554432
-  maxConnReceiveWindow: 33554432
-
-auth:
-  type: password
-  password: $auth_pwd
-
-EOF
-
     if [[ $bwChange == 1 ]]; then
-        cat << EOF >> /etc/hysteria/config.yaml
-bandwidth:
-  up: 100 mbps
-  down: 100 mbps
-
-EOF
+        limit_bandwidth="yes"
+        bandwidth_value="100"
         yellow "已设置为：100 Mbps 限速"
     elif [[ $bwChange == 2 ]]; then
         read -p "请输入限速数值 (单位 mbps，例如 50): " custBw
         [[ -z $custBw ]] && custBw=100
-        cat << EOF >> /etc/hysteria/config.yaml
-bandwidth:
-  up: $custBw mbps
-  down: $custBw mbps
-
-EOF
+        limit_bandwidth="yes"
+        bandwidth_value="$custBw"
         yellow "已设置为：$custBw Mbps 限速"
     else
+        limit_bandwidth="no"
+        bandwidth_value=""
         yellow "已关闭带宽限制"
     fi
 
-    cat << EOF >> /etc/hysteria/config.yaml
-masquerade:
-EOF
-    if [[ $masq_type == "proxy" ]]; then
-        cat << EOF >> /etc/hysteria/config.yaml
-  type: proxy
-  proxy:
-    url: https://$proxysite
-    rewriteHost: true
-EOF
-    else
-        cat << EOF >> /etc/hysteria/config.yaml
-  type: string
-  string:
-    content: "<h1>403 Forbidden</h1><p>You don't have permission to access this resource.</p><hr><address>Nginx</address>"
-    headers:
-      Content-Type: text/html; charset=utf-8
-      Server: nginx
-    statusCode: 403
-EOF
-    fi
-
+    generate_config
     stophysteria && starthysteria
     green "带宽限制配置已更新！"
 }
 
 changeport(){
+    read_current_config
     inst_port_config
-    
-    cert_path=$(grep "cert:" /etc/hysteria/config.yaml | awk '{print $2}')
-    key_path=$(grep "key:" /etc/hysteria/config.yaml | awk '{print $2}')
-    auth_pwd=$(grep "password:" /etc/hysteria/config.yaml | awk '{print $2}')
-    
-    if grep -q "bandwidth:" /etc/hysteria/config.yaml; then
-        limit_bandwidth="yes" 
-    else
-        limit_bandwidth="no"
-    fi
-    
-    inst_site
     generate_config
+    generate_client_config
     stophysteria && starthysteria
     green "Hysteria 2 端口配置已更新！"
     showconf
 }
 
 changepasswd(){
-    oldpasswd=$(grep "password:" /etc/hysteria/config.yaml | awk '{print $2}')
-    read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" passwd
-    [[ -z $passwd ]] && passwd=$(date +%s%N | md5sum | cut -c 1-8)
-    sed -i "s#password: $oldpasswd#password: $passwd#g" /etc/hysteria/config.yaml
-    sed -i "s#$oldpasswd#$passwd#g" /root/hy/hy-client.yaml
-    sed -i "s#$oldpasswd#$passwd#g" /root/hy/hy-client.json
+    read_current_config
+    read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" new_pwd
+    [[ -z $new_pwd ]] && new_pwd=$(date +%s%N | md5sum | cut -c 1-8)
+    auth_pwd=$new_pwd
+    generate_config
+    generate_client_config
     stophysteria && starthysteria
-    green "Hysteria 2 节点密码已成功修改为：$passwd"
+    green "Hysteria 2 节点密码已成功修改为：$auth_pwd"
     showconf
 }
 
 change_cert(){
-    old_cert=$(cat /etc/hysteria/config.yaml | grep cert | awk -F " " '{print $2}')
-    old_key=$(cat /etc/hysteria/config.yaml | grep key | awk -F " " '{print $2}')
-    old_hydomain=$(cat /root/hy/hy-client.yaml | grep sni | awk '{print $2}')
+    read_current_config
     inst_cert
-    sed -i "s!$old_cert!$cert_path!g" /etc/hysteria/config.yaml
-    sed -i "s!$old_key!$key_path!g" /etc/hysteria/config.yaml
-    sed -i "6s/$old_hydomain/$hy_domain/g" /root/hy/hy-client.yaml
-    sed -i "5s/$old_hydomain/$hy_domain/g" /root/hy/hy-client.json
+    generate_config
+    generate_client_config
     stophysteria && starthysteria
     green "Hysteria 2 节点证书类型已成功修改"
     showconf
 }
 
 changeproxysite(){
-    port=$(grep "listen:" /etc/hysteria/config.yaml | awk '{print $2}' | sed 's/://g')
-    cert_path=$(grep "cert:" /etc/hysteria/config.yaml | awk '{print $2}')
-    key_path=$(grep "key:" /etc/hysteria/config.yaml | awk '{print $2}')
-    auth_pwd=$(grep "password:" /etc/hysteria/config.yaml | awk '{print $2}')
-    
-    if grep -q "bandwidth:" /etc/hysteria/config.yaml; then
-        limit_bandwidth="yes"
-    else
-        limit_bandwidth="no"
-    fi
-    
+    read_current_config
     inst_site
     generate_config
     stophysteria && starthysteria
@@ -662,6 +670,10 @@ changeconf(){
 }
 
 showconf(){
+    if [[ ! -f /root/hy/hy-client.yaml ]]; then
+        red "未找到客户端配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
     yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下"
     red "$(cat /root/hy/hy-client.yaml)"
     yellow "Hysteria 2 客户端 JSON 配置文件 hy-client.json 内容如下"
