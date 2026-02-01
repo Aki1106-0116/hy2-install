@@ -141,6 +141,8 @@ inst_cert(){
     if [[ $certInput == 2 ]]; then
         cert_path="/etc/hysteria/cert.crt"
         key_path="/etc/hysteria/private.key"
+        # ACME申请的证书是受信任的，不需要跳过验证
+        insecure=0
 
         if [[ -f $cert_path && -f $key_path && -s $cert_path && -s $key_path ]] && [[ -f /root/ca.log ]]; then
             domain=$(cat /root/ca.log)
@@ -214,6 +216,8 @@ inst_cert(){
         fi
         
         hy_domain=$domain
+        # 用户提供的证书默认是受信任的，不需要跳过验证
+        insecure=0
     else
         green "将使用必应自签证书作为 Hysteria 2 的节点证书"
         
@@ -223,6 +227,8 @@ inst_cert(){
         openssl req -new -x509 -days 36500 -key /etc/hysteria/private.key -out /etc/hysteria/cert.crt -subj "/CN=www.bing.com"
         hy_domain="www.bing.com"
         domain="www.bing.com"
+        # 自签证书需要跳过验证
+        insecure=1
     fi
 }
 
@@ -441,6 +447,13 @@ generate_client_config(){
         last_ip=$ip
     fi
 
+    # 根据 insecure 变量设置布尔值
+    if [[ $insecure == 1 ]]; then
+        insecure_bool="true"
+    else
+        insecure_bool="false"
+    fi
+
     mkdir -p /root/hy
     
     # 生成 YAML 客户端配置
@@ -451,7 +464,7 @@ auth: $auth_pwd
 
 tls:
   sni: $hy_domain
-  insecure: true
+  insecure: $insecure_bool
 
 quic:
   initStreamReceiveWindow: 16777216
@@ -483,7 +496,7 @@ EOF
   "auth": "$auth_pwd",
   "tls": {
     "sni": "$hy_domain",
-    "insecure": true
+    "insecure": $insecure_bool
   },
   "quic": {
     "initStreamReceiveWindow": 16777216,
@@ -508,7 +521,7 @@ EOF
   "auth": "$auth_pwd",
   "tls": {
     "sni": "$hy_domain",
-    "insecure": true
+    "insecure": $insecure_bool
   },
   "quic": {
     "initStreamReceiveWindow": 16777216,
@@ -528,11 +541,11 @@ EOF
     
     # 生成订阅链接 - 按照标准格式
     if [[ -n $firstport && -n $endport ]]; then
-        # 端口跳跃模式：hysteria2://密码@IP:主端口?security=tls&mportHopInt=间隔&insecure=1&mport=范围&sni=域名#名称
-        url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${hop_interval:-25}&insecure=1&mport=${firstport}-${endport}&sni=${hy_domain}#Hysteria2"
+        # 端口跳跃模式
+        url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${hop_interval:-25}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${hy_domain}#Hysteria2"
     else
-        # 单端口模式：hysteria2://密码@IP:端口?security=tls&insecure=1&sni=域名#名称
-        url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&insecure=1&sni=${hy_domain}#Hysteria2"
+        # 单端口模式
+        url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&insecure=${insecure}&sni=${hy_domain}#Hysteria2"
     fi
     
     echo "$url" > /root/hy/url.txt
@@ -566,10 +579,23 @@ read_current_config(){
             hy_domain=$(grep "sni:" /root/hy/hy-client.yaml | awk '{print $2}')
             # 读取跳跃间隔
             hop_interval=$(grep "hopInterval:" /root/hy/hy-client.yaml | awk '{print $2}' | sed 's/s$//')
+            # 读取 insecure 设置
+            insecure_value=$(grep "insecure:" /root/hy/hy-client.yaml | awk '{print $2}')
+            if [[ $insecure_value == "true" ]]; then
+                insecure=1
+            else
+                insecure=0
+            fi
         else
             hy_domain=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN = //;s/,.*//' | sed 's/.*CN=//;s/,.*//')
             [[ -z $hy_domain ]] && hy_domain="www.bing.com"
             hop_interval=25
+            # 如果是 bing.com 则认为是自签证书
+            if [[ $hy_domain == "www.bing.com" ]]; then
+                insecure=1
+            else
+                insecure=0
+            fi
         fi
         
         # 使用兼容的方式检测端口跳跃规则
