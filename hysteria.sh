@@ -28,12 +28,18 @@ PACKAGE_INSTALL=("apt -y install" "apt -y install" "yum -y install" "yum -y inst
 
 CMD=("$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(hostnamectl 2>/dev/null | grep -i system | cut -d : -f2)" "$(lsb_release -sd 2>/dev/null)" "$(grep -i description /etc/lsb-release 2>/dev/null | cut -d \" -f2)" "$(grep . /etc/redhat-release 2>/dev/null)" "$(grep . /etc/issue 2>/dev/null | cut -d \\ -f1 | sed '/^[ ]*$/d')")
 
+SYS=""
 for i in "${CMD[@]}"; do
     SYS="$i" && [[ -n $SYS ]] && break
 done
 
+SYSTEM=""
+int=0
 for ((int = 0; int < ${#REGEX[@]}; int++)); do
-    [[ $(echo "$SYS" | tr '[:upper:]' '[:lower:]') =~ ${REGEX[int]} ]] && SYSTEM="${RELEASE[int]}" && [[ -n $SYSTEM ]] && break
+    if [[ $(echo "$SYS" | tr '[:upper:]' '[:lower:]') =~ ${REGEX[int]} ]]; then
+        SYSTEM="${RELEASE[int]}"
+        [[ -n $SYSTEM ]] && break
+    fi
 done
 
 [[ -z $SYSTEM ]] && red "目前暂不支持你的VPS的操作系统！" && exit 1
@@ -44,6 +50,24 @@ if [[ -z $(type -P curl) ]]; then
     fi
     ${PACKAGE_INSTALL[int]} curl
 fi
+
+# URL编码函数
+urlencode() {
+    local string="$1"
+    local strlen=${#string}
+    local encoded=""
+    local pos c o
+
+    for (( pos=0 ; pos<strlen ; pos++ )); do
+        c=${string:$pos:1}
+        case "$c" in
+            [-_.~a-zA-Z0-9] ) o="$c" ;;
+            * ) printf -v o '%%%02X' "'$c" ;;
+        esac
+        encoded+="$o"
+    done
+    echo "$encoded"
+}
 
 realip(){
     ip=$(curl -s4m8 ip.sb -k) || ip=$(curl -s6m8 ip.sb -k)
@@ -71,7 +95,23 @@ install_iptables_persistent(){
         systemctl start iptables >/dev/null 2>&1
         systemctl start ip6tables >/dev/null 2>&1
     else
-        ${PACKAGE_INSTALL[int]} iptables-persistent netfilter-persistent
+        # 非交互式安装 iptables-persistent
+        echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null
+        echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null
+        DEBIAN_FRONTEND=noninteractive ${PACKAGE_INSTALL[int]} iptables-persistent netfilter-persistent
+    fi
+}
+
+fix_permissions(){
+    if id "hysteria" &>/dev/null; then
+        chown -R hysteria:hysteria /etc/hysteria
+    fi
+    chmod 755 /etc/hysteria
+    if [[ -f /etc/hysteria/cert.crt ]]; then
+        chmod 644 /etc/hysteria/cert.crt
+    fi
+    if [[ -f /etc/hysteria/private.key ]]; then
+        chmod 600 /etc/hysteria/private.key
     fi
 }
 
@@ -147,12 +187,11 @@ inst_cert(){
             
             bash ~/.acme.sh/acme.sh --install-cert -d ${domain} --key-file /etc/hysteria/private.key --fullchain-file /etc/hysteria/cert.crt --ecc
             
-            if [[ -f /etc/hysteria/cert.crt && -f /etc/hysteria/private.key ]]; then
+            if [[ -f /etc/hysteria/cert.crt && -f /etc/hysteria/private.key ]] && [[ -s /etc/hysteria/cert.crt && -s /etc/hysteria/private.key ]]; then
                 echo $domain > /root/ca.log
                 sed -i '/--cron/d' /etc/crontab >/dev/null 2>&1
                 echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
-                chmod 644 /etc/hysteria/cert.crt
-                chmod 600 /etc/hysteria/private.key
+                
                 green "证书申请成功!"
                 hy_domain=$domain
             else
@@ -164,6 +203,16 @@ inst_cert(){
         read -p "请输入公钥文件 crt 的路径：" cert_path
         read -p "请输入密钥文件 key 的路径：" key_path
         read -p "请输入证书的域名：" domain
+        
+        if [[ ! -f $cert_path ]]; then
+            red "证书文件不存在：$cert_path"
+            exit 1
+        fi
+        if [[ ! -f $key_path ]]; then
+            red "密钥文件不存在：$key_path"
+            exit 1
+        fi
+        
         hy_domain=$domain
     else
         green "将使用必应自签证书作为 Hysteria 2 的节点证书"
@@ -172,8 +221,6 @@ inst_cert(){
         key_path="/etc/hysteria/private.key"
         openssl ecparam -genkey -name prime256v1 -out /etc/hysteria/private.key
         openssl req -new -x509 -days 36500 -key /etc/hysteria/private.key -out /etc/hysteria/cert.crt -subj "/CN=www.bing.com"
-        chmod 644 /etc/hysteria/cert.crt
-        chmod 600 /etc/hysteria/private.key
         hy_domain="www.bing.com"
         domain="www.bing.com"
     fi
@@ -203,6 +250,7 @@ inst_port_config(){
         
         firstport=""
         endport=""
+        hop_interval=""
         
         iptables -I INPUT -p udp --dport $port -j ACCEPT
         ip6tables -I INPUT -p udp --dport $port -j ACCEPT
@@ -231,13 +279,32 @@ inst_port_config(){
         read -p "请输入结束端口 (回车默认为 起始端口+75 -> $default_endport): " endport
         [[ -z $endport ]] && endport=$default_endport
 
-        if [[ $firstport -ge $endport ]]; then
-            until [[ $firstport -lt $endport ]]; do
+        # 添加数字验证和空值处理
+        while true; do
+            if [[ ! $firstport =~ ^[0-9]+$ ]] || [[ ! $endport =~ ^[0-9]+$ ]]; then
+                red "端口必须是数字！"
+                read -p "请重新输入起始端口：" firstport
+                [[ -z $firstport ]] && firstport=$(shuf -i 2500-10000 -n 1)
+                read -p "请重新输入结束端口：" endport
+                [[ -z $endport ]] && endport=$((firstport + 75))
+                continue
+            fi
+            
+            if [[ $firstport -ge $endport ]]; then
                 red "起始端口必须小于结束端口！"
                 read -p "请重新输入起始端口：" firstport
+                [[ -z $firstport ]] && firstport=$(shuf -i 2500-10000 -n 1)
                 read -p "请重新输入结束端口：" endport
-            done
-        fi
+                [[ -z $endport ]] && endport=$((firstport + 75))
+                continue
+            fi
+            
+            break
+        done
+        
+        # 设置端口跳跃间隔
+        read -p "请输入端口跳跃间隔秒数 [默认25]: " hop_interval
+        [[ -z $hop_interval ]] && hop_interval=25
         
         port=$firstport
         
@@ -248,7 +315,7 @@ inst_port_config(){
         ip6tables -I INPUT -p udp --dport $firstport:$endport -j ACCEPT
         save_iptables_rules
         
-        yellow "端口跳跃设置完成：$firstport - $endport (主监听端口: $port)"
+        yellow "端口跳跃设置完成：$firstport - $endport (主监听端口: $port, 跳跃间隔: ${hop_interval}s)"
     fi
 }
 
@@ -309,7 +376,7 @@ generate_config(){
     mkdir -p /etc/hysteria
 
     cat << EOF > /etc/hysteria/config.yaml
-listen: "[::]:$port"
+listen: :$port
 
 tls:
   cert: $cert_path
@@ -323,7 +390,7 @@ quic:
 
 auth:
   type: password
-  password: $auth_pwd
+  password: "$auth_pwd"
 
 EOF
 
@@ -362,7 +429,7 @@ EOF
 generate_client_config(){
     realip
     
-    if [[ -n $firstport ]]; then
+    if [[ -n $firstport && -n $endport ]]; then
         server_port_string="$port,$firstport-$endport"
     else
         server_port_string=$port
@@ -375,6 +442,8 @@ generate_client_config(){
     fi
 
     mkdir -p /root/hy
+    
+    # 生成 YAML 客户端配置
     cat << EOF > /root/hy/hy-client.yaml
 server: $last_ip:$server_port_string
 
@@ -395,12 +464,20 @@ fastOpen: true
 socks5:
   listen: 127.0.0.1:5678
 
+EOF
+
+    # 仅在端口跳跃模式下添加 transport 配置
+    if [[ -n $firstport && -n $endport ]]; then
+        cat << EOF >> /root/hy/hy-client.yaml
 transport:
   udp:
-    hopInterval: 25s 
+    hopInterval: ${hop_interval:-25}s
 EOF
+    fi
     
-    cat << EOF > /root/hy/hy-client.json
+    # 生成 JSON 配置
+    if [[ -n $firstport && -n $endport ]]; then
+        cat << EOF > /root/hy/hy-client.json
 {
   "server": "$last_ip:$server_port_string",
   "auth": "$auth_pwd",
@@ -419,33 +496,59 @@ EOF
   },
   "transport": {
     "udp": {
-      "hopInterval": "25s"
+      "hopInterval": "${hop_interval:-25}s"
     }
   }
 }
 EOF
-
-    url="hysteria2://${auth_pwd}@${last_ip}:${port}?security=tls&insecure=1&sni=${hy_domain}&mportHopInt=25"
-    
-    if [[ -n $firstport ]]; then
-        url="${url}&mport=${firstport}-${endport}"
+    else
+        cat << EOF > /root/hy/hy-client.json
+{
+  "server": "$last_ip:$server_port_string",
+  "auth": "$auth_pwd",
+  "tls": {
+    "sni": "$hy_domain",
+    "insecure": true
+  },
+  "quic": {
+    "initStreamReceiveWindow": 16777216,
+    "maxStreamReceiveWindow": 16777216,
+    "initConnReceiveWindow": 33554432,
+    "maxConnReceiveWindow": 33554432
+  },
+  "socks5": {
+    "listen": "127.0.0.1:5678"
+  }
+}
+EOF
     fi
+
+    # URL编码密码
+    encoded_pwd=$(urlencode "$auth_pwd")
     
-    url="${url}#Hysteria2"
+    # 生成订阅链接 - 按照标准格式
+    if [[ -n $firstport && -n $endport ]]; then
+        # 端口跳跃模式：hysteria2://密码@IP:主端口?security=tls&mportHopInt=间隔&insecure=1&mport=范围&sni=域名#名称
+        url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${hop_interval:-25}&insecure=1&mport=${firstport}-${endport}&sni=${hy_domain}#Hysteria2"
+    else
+        # 单端口模式：hysteria2://密码@IP:端口?security=tls&insecure=1&sni=域名#名称
+        url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&insecure=1&sni=${hy_domain}#Hysteria2"
+    fi
     
     echo "$url" > /root/hy/url.txt
 }
 
 read_current_config(){
     if [[ -f /etc/hysteria/config.yaml ]]; then
-        port=$(grep "^listen:" /etc/hysteria/config.yaml | awk '{print $2}' | tr -d '"[]' | awk -F: '{print $NF}')
+        # 更准确的端口解析
+        port=$(grep "^listen:" /etc/hysteria/config.yaml | sed 's/listen://g' | sed 's/[[:space:]]//g' | sed 's/\[.*\]//g' | sed 's/://g')
         cert_path=$(grep "cert:" /etc/hysteria/config.yaml | awk '{print $2}')
         key_path=$(grep "key:" /etc/hysteria/config.yaml | awk '{print $2}')
-        auth_pwd=$(grep "password:" /etc/hysteria/config.yaml | awk '{print $2}')
+        auth_pwd=$(grep "password:" /etc/hysteria/config.yaml | awk '{print $2}' | sed 's/"//g')
         
         if grep -q "type: proxy" /etc/hysteria/config.yaml; then
             masq_type="proxy"
-            proxysite=$(grep "url:" /etc/hysteria/config.yaml | sed 's/.*https:\/\///g' | sed 's/ //g')
+            proxysite=$(grep "url:" /etc/hysteria/config.yaml | sed 's/.*https:\/\///g' | sed 's/[[:space:]]//g')
         else
             masq_type="string"
             proxysite=""
@@ -461,19 +564,25 @@ read_current_config(){
         
         if [[ -f /root/hy/hy-client.yaml ]]; then
             hy_domain=$(grep "sni:" /root/hy/hy-client.yaml | awk '{print $2}')
+            # 读取跳跃间隔
+            hop_interval=$(grep "hopInterval:" /root/hy/hy-client.yaml | awk '{print $2}' | sed 's/s$//')
         else
-            hy_domain=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN = //;s/,.*//')
+            hy_domain=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN = //;s/,.*//' | sed 's/.*CN=//;s/,.*//')
             [[ -z $hy_domain ]] && hy_domain="www.bing.com"
+            hop_interval=25
         fi
         
-        port_hop_rule=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep -E "dpts?:[0-9]+" | head -1)
+        # 使用兼容的方式检测端口跳跃规则
+        port_hop_rule=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep "dpts:" | head -1)
         if [[ -n $port_hop_rule ]]; then
-            firstport=$(echo "$port_hop_rule" | grep -oP 'dpts:\K[0-9]+' | head -1)
-            endport=$(echo "$port_hop_rule" | grep -oP 'dpts:[0-9]+:\K[0-9]+')
-            if [[ -z $endport ]]; then
-                port_range=$(echo "$port_hop_rule" | grep -oP 'dpt[s]?:[0-9:]+' | sed 's/dpts\?://')
+            # 提取端口范围，如 "dpts:2500:2575"
+            port_range=$(echo "$port_hop_rule" | grep -o 'dpts:[0-9]*:[0-9]*' | sed 's/dpts://')
+            if [[ -n $port_range ]]; then
                 firstport=$(echo "$port_range" | cut -d: -f1)
                 endport=$(echo "$port_range" | cut -d: -f2)
+            else
+                firstport=""
+                endport=""
             fi
         else
             firstport=""
@@ -502,13 +611,18 @@ insthysteria(){
     if [[ ! ${SYSTEM} == "CentOS" ]]; then
         ${PACKAGE_UPDATE[int]}
     fi
-    ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps
-    
+    ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps openssl
+
     install_iptables_persistent
 
     wget -N https://raw.githubusercontent.com/Misaka-blog/hysteria-install/main/hy2/install_server.sh
     bash install_server.sh
     rm -f install_server.sh
+
+    if [[ ! -f /usr/local/bin/hysteria ]]; then
+        red "Hysteria 2 安装失败！"
+        exit 1
+    fi
 
     inst_cert
     inst_port_config
@@ -517,6 +631,8 @@ insthysteria(){
     inst_bandwidth
     generate_config
     generate_client_config
+
+    fix_permissions
 
     systemctl daemon-reload
     systemctl enable hysteria-server
@@ -530,10 +646,11 @@ insthysteria(){
         chmod +x /usr/bin/hy2
     fi
 
+    sleep 2
     if [[ -n $(systemctl status hysteria-server 2>/dev/null | grep -w active) && -f '/etc/hysteria/config.yaml' ]]; then
         green "Hysteria 2 服务启动成功"
     else
-        red "Hysteria 2 服务启动失败" && exit 1
+        red "Hysteria 2 服务启动失败，请检查日志：journalctl -u hysteria-server -e" && exit 1
     fi
     red "======================================================================================"
     green "Hysteria 2 代理服务安装完成"
@@ -555,22 +672,30 @@ unsthysteria(){
     systemctl stop hysteria-server.service >/dev/null 2>&1
     systemctl disable hysteria-server.service >/dev/null 2>&1
     rm -f /lib/systemd/system/hysteria-server.service /lib/systemd/system/hysteria-server@.service
+    rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
     rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy /root/hysteria.sh
     rm -f /usr/bin/hy2
     iptables -t nat -F PREROUTING >/dev/null 2>&1
     ip6tables -t nat -F PREROUTING >/dev/null 2>&1
     save_iptables_rules
+    systemctl daemon-reload
     green "Hysteria 2 已彻底卸载完成！"
 }
 
 starthysteria(){
     systemctl start hysteria-server
     systemctl enable hysteria-server >/dev/null 2>&1
+    if [[ -n $(systemctl status hysteria-server 2>/dev/null | grep -w active) ]]; then
+        green "Hysteria 2 启动成功"
+    else
+        red "Hysteria 2 启动失败，请查看日志：journalctl -u hysteria-server -e"
+    fi
 }
 
 stophysteria(){
     systemctl stop hysteria-server
     systemctl disable hysteria-server >/dev/null 2>&1
+    green "Hysteria 2 已停止"
 }
 
 hysteriaswitch(){
@@ -580,7 +705,7 @@ hysteriaswitch(){
     echo -e " ${GREEN}2.${PLAIN} 关闭 Hysteria 2"
     echo -e " ${GREEN}3.${PLAIN} 重启 Hysteria 2"
     echo ""
-    read -rp "请输入选项 [0-3]: " switchInput
+    read -rp "请输入选项 [1-3]: " switchInput
     case $switchInput in
         1 ) starthysteria ;;
         2 ) stophysteria ;;
@@ -590,7 +715,10 @@ hysteriaswitch(){
 }
 
 changebandwidth(){
-    read_current_config
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
     
     echo ""
     green "请选择是否开启带宽限速 (推荐开启以防止阻断)："
@@ -617,46 +745,63 @@ changebandwidth(){
     fi
 
     generate_config
+    fix_permissions
     stophysteria && starthysteria
     green "带宽限制配置已更新！"
 }
 
 changeport(){
-    read_current_config
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
     inst_port_config
     generate_config
     generate_client_config
+    fix_permissions
     stophysteria && starthysteria
     green "Hysteria 2 端口配置已更新！"
     showconf
 }
 
 changepasswd(){
-    read_current_config
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
     read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" new_pwd
     [[ -z $new_pwd ]] && new_pwd=$(date +%s%N | md5sum | cut -c 1-8)
     auth_pwd=$new_pwd
     generate_config
     generate_client_config
+    fix_permissions
     stophysteria && starthysteria
     green "Hysteria 2 节点密码已成功修改为：$auth_pwd"
     showconf
 }
 
 change_cert(){
-    read_current_config
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
     inst_cert
     generate_config
     generate_client_config
+    fix_permissions
     stophysteria && starthysteria
     green "Hysteria 2 节点证书类型已成功修改"
     showconf
 }
 
 changeproxysite(){
-    read_current_config
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
     inst_site
     generate_config
+    fix_permissions
     stophysteria && starthysteria
     green "Hysteria 2 节点伪装形式已修改成功！"
 }
@@ -715,6 +860,7 @@ menu() {
         3 ) hysteriaswitch ;;
         4 ) changeconf ;;
         5 ) showconf ;;
+        0 ) exit 0 ;;
         * ) exit 1 ;;
     esac
 }
