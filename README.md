@@ -5,7 +5,7 @@
 
 使用 root 用户登录 VPS，执行以下命令：
 ```bash
-wget -N --no-check-certificate [https://raw.githubusercontent.com/Aki1106_0116/hy2-install/main/hysteria.sh](https://raw.githubusercontent.com/Aki1106_0116/hy2-install/main/hysteria.sh) && bash hysteria.sh
+wget -N --no-check-certificate https://raw.githubusercontent.com/Aki1106-0116/hy2-install/main/hysteria.sh && bash hysteria.sh
 ```
 
 
