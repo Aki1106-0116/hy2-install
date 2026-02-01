@@ -24,7 +24,7 @@ RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora")
 PACKAGE_UPDATE=("apt-get update" "apt-get update" "yum -y update" "yum -y update" "yum -y update")
 PACKAGE_INSTALL=("apt -y install" "apt -y install" "yum -y install" "yum -y install" "yum -y install")
 
-[[ $EUID -ne 0 ]] && red "请注意：必须使用 root 用户才能运行此脚本！" && exit 1
+[[ $EUID -ne 0 ]] && red "注意: 请在root用户下运行脚本" && exit 1
 
 CMD=("$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(hostnamectl 2>/dev/null | grep -i system | cut -d : -f2)" "$(lsb_release -sd 2>/dev/null)" "$(grep -i description /etc/lsb-release 2>/dev/null | cut -d \" -f2)" "$(grep . /etc/redhat-release 2>/dev/null)" "$(grep . /etc/issue 2>/dev/null | cut -d \\ -f1 | sed '/^[ ]*$/d')")
 
@@ -42,7 +42,7 @@ for ((int = 0; int < ${#REGEX[@]}; int++)); do
     fi
 done
 
-[[ -z $SYSTEM ]] && red "抱歉，脚本目前不支持您的 VPS 操作系统！" && exit 1
+[[ -z $SYSTEM ]] && red "目前暂不支持你的VPS的操作系统！" && exit 1
 
 if [[ -z $(type -P curl) ]]; then
     if [[ ! $SYSTEM == "CentOS" ]]; then
@@ -51,6 +51,7 @@ if [[ -z $(type -P curl) ]]; then
     ${PACKAGE_INSTALL[int]} curl
 fi
 
+# URL编码函数
 urlencode() {
     local string="$1"
     local strlen=${#string}
@@ -66,28 +67,6 @@ urlencode() {
         encoded+="$o"
     done
     echo "$encoded"
-}
-
-escape_json_string() {
-    local string="$1"
-    string="${string//\\/\\\\}"
-    string="${string//\"/\\\"}"
-    string="${string//$'\n'/\\n}"
-    string="${string//$'\r'/\\r}"
-    string="${string//$'\t'/\\t}"
-    echo "$string"
-}
-
-escape_yaml_string() {
-    local string="$1"
-    if [[ "$string" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        echo "$string"
-    else
-        string="${string//\\/\\\\}"
-        string="${string//\"/\\\"}"
-        string="${string//	/\\t}"
-        echo "\"$string\""
-    fi
 }
 
 realip(){
@@ -116,6 +95,7 @@ install_iptables_persistent(){
         systemctl start iptables >/dev/null 2>&1
         systemctl start ip6tables >/dev/null 2>&1
     else
+        # 非交互式安装 iptables-persistent
         echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null
         echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null
         DEBIAN_FRONTEND=noninteractive ${PACKAGE_INSTALL[int]} iptables-persistent netfilter-persistent
@@ -135,454 +115,156 @@ fix_permissions(){
     fi
 }
 
-get_cert_domains(){
-    local cert_file="$1"
-    
-    if [[ ! -f "$cert_file" ]]; then
-        echo ""
-        return
-    fi
-    
-    local cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN\s*=\s*\([^,/]*\).*/\1/p' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    local san=$(openssl x509 -in "$cert_file" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -1 | sed 's/DNS://g' | tr ',' '\n' | sed 's/^[[:space:]]*//' | tr '\n' ' ')
-    
-    echo "$cn $san" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//'
-}
-
-cert_contains_domain(){
-    local cert_file="$1"
-    local target_domain="$2"
-    
-    local cert_domains=$(get_cert_domains "$cert_file")
-    
-    for d in $cert_domains; do
-        if [[ "$d" == "$target_domain" ]]; then
-            return 0
-        fi
-        if [[ "$d" == "*."* ]]; then
-            local wildcard_base="${d#\*.}"
-            if [[ "$target_domain" == *".$wildcard_base" ]] || [[ "$target_domain" == "$wildcard_base" ]]; then
-                return 0
-            fi
-        fi
-    done
-    return 1
-}
-
-get_cert_primary_domain(){
-    local cert_file="$1"
-    
-    if [[ ! -f "$cert_file" ]]; then
-        echo ""
-        return
-    fi
-    
-    local cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN\s*=\s*\([^,/]*\).*/\1/p' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    
-    if [[ -n "$cn" ]]; then
-        echo "$cn"
-        return
-    fi
-    
-    local san=$(openssl x509 -in "$cert_file" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -1 | sed 's/DNS://g' | tr ',' '\n' | sed 's/^[[:space:]]*//' | head -1)
-    
-    echo "$san"
-}
-
-save_cert_config(){
-    local mode="$1"
-    local domain="$2"
-    local source_cert="$3"
-    local source_key="$4"
-    
+inst_cert(){
     mkdir -p /etc/hysteria
+
+    green "请选择 Hysteria 2 协议的证书申请方式："
+    echo ""
     
-    cat << EOF > /etc/hysteria/cert_source.conf
-CERT_MODE=$mode
-CERT_DOMAIN=$domain
-SOURCE_CERT_PATH=$source_cert
-SOURCE_KEY_PATH=$source_key
-EOF
+    echo -e " ${GREEN}1.${PLAIN} 使用自签证书 (必应伪装) ${YELLOW}（默认）${PLAIN}"
+    echo -e "    ${PLAIN}说明：${RED}不推荐！安全性较低，伪装效果差，流量易被识别阻断。${PLAIN}"
+    echo -e "          仅建议完全没有域名，或仅想快速测试连接的用户选择。"
+    echo ""
     
-    chmod 600 /etc/hysteria/cert_source.conf
-}
-
-read_cert_config(){
-    if [[ -f /etc/hysteria/cert_source.conf ]]; then
-        source /etc/hysteria/cert_source.conf
-        return 0
-    fi
-    return 1
-}
-
-create_cert_sync_script(){
-    cat << 'SYNCEOF' > /etc/hysteria/sync_cert.sh
-#!/bin/bash
-
-LOG_FILE="/etc/hysteria/sync_cert.log"
-CONF_FILE="/etc/hysteria/cert_source.conf"
-LOCK_FILE="/tmp/hysteria_cert_sync.lock"
-
-exec 200>"$LOCK_FILE"
-flock -n 200 || exit 0
-
-log(){
-    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-    echo "$msg" >> "$LOG_FILE"
-    local line_count=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
-    if [[ "$line_count" -gt 200 ]]; then
-        local tmp_file=$(mktemp)
-        tail -100 "$LOG_FILE" > "$tmp_file" && mv "$tmp_file" "$LOG_FILE"
-    fi
-}
-
-if [[ ! -f "$CONF_FILE" ]]; then
-    exit 0
-fi
-
-source "$CONF_FILE"
-
-if [[ "$CERT_MODE" == "selfsigned" ]]; then
-    exit 0
-fi
-
-if [[ -z "$SOURCE_CERT_PATH" ]] || [[ -z "$SOURCE_KEY_PATH" ]] || [[ -z "$CERT_DOMAIN" ]]; then
-    log "ERROR: 配置不完整"
-    exit 1
-fi
-
-sleep 2
-
-REAL_CERT_PATH=$(readlink -f "$SOURCE_CERT_PATH" 2>/dev/null || echo "$SOURCE_CERT_PATH")
-REAL_KEY_PATH=$(readlink -f "$SOURCE_KEY_PATH" 2>/dev/null || echo "$SOURCE_KEY_PATH")
-
-if [[ ! -f "$REAL_CERT_PATH" ]] || [[ ! -f "$REAL_KEY_PATH" ]]; then
-    log "ERROR: 源文件不存在 (cert: $REAL_CERT_PATH, key: $REAL_KEY_PATH)"
-    exit 1
-fi
-
-SOURCE_HASH=$(cat "$REAL_CERT_PATH" "$REAL_KEY_PATH" 2>/dev/null | md5sum | cut -d' ' -f1)
-DEST_HASH=""
-if [[ -f /etc/hysteria/cert.crt ]] && [[ -f /etc/hysteria/private.key ]]; then
-    DEST_HASH=$(cat /etc/hysteria/cert.crt /etc/hysteria/private.key 2>/dev/null | md5sum | cut -d' ' -f1)
-fi
-
-if [[ "$SOURCE_HASH" == "$DEST_HASH" ]] && [[ -n "$DEST_HASH" ]]; then
-    exit 0
-fi
-
-if ! openssl x509 -in "$REAL_CERT_PATH" -noout -checkend 0 2>/dev/null; then
-    log "ERROR: 源证书已过期或无效"
-    exit 1
-fi
-
-CERT_CN=$(openssl x509 -in "$REAL_CERT_PATH" -noout -subject 2>/dev/null | sed -n 's/.*CN\s*=\s*\([^,/]*\).*/\1/p')
-
-log "INFO: 检测到证书更新，开始同步 (CN=$CERT_CN, 配置域名=$CERT_DOMAIN)"
-
-cp -f "$REAL_CERT_PATH" /etc/hysteria/cert.crt.new
-cp -f "$REAL_KEY_PATH" /etc/hysteria/private.key.new
-
-if [[ ! -s /etc/hysteria/cert.crt.new ]] || [[ ! -s /etc/hysteria/private.key.new ]]; then
-    log "ERROR: 复制失败"
-    rm -f /etc/hysteria/cert.crt.new /etc/hysteria/private.key.new
-    exit 1
-fi
-
-mv -f /etc/hysteria/cert.crt.new /etc/hysteria/cert.crt
-mv -f /etc/hysteria/private.key.new /etc/hysteria/private.key
-
-if id "hysteria" &>/dev/null; then
-    chown hysteria:hysteria /etc/hysteria/cert.crt /etc/hysteria/private.key
-fi
-chmod 644 /etc/hysteria/cert.crt
-chmod 600 /etc/hysteria/private.key
-
-if systemctl is-active hysteria-server &>/dev/null; then
-    if systemctl reload hysteria-server 2>/dev/null; then
-        log "SUCCESS: 证书同步完成，服务已重载"
-    elif systemctl restart hysteria-server 2>/dev/null; then
-        log "SUCCESS: 证书同步完成，服务已重启"
-    else
-        log "ERROR: 服务重启失败"
-        exit 1
-    fi
-else
-    log "INFO: 证书已同步（服务未运行）"
-fi
-SYNCEOF
-    chmod +x /etc/hysteria/sync_cert.sh
-}
-
-create_cert_watcher_script(){
-    cat << 'WATCHEOF' > /etc/hysteria/cert_watcher.sh
-#!/bin/bash
-
-CONF_FILE="/etc/hysteria/cert_source.conf"
-LOG_FILE="/etc/hysteria/sync_cert.log"
-
-log(){
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WATCHER] $1" >> "$LOG_FILE"
-}
-
-if [[ ! -f "$CONF_FILE" ]]; then
-    log "ERROR: 配置文件不存在，退出监控"
-    exit 1
-fi
-
-source "$CONF_FILE"
-
-if [[ "$CERT_MODE" == "selfsigned" ]]; then
-    log "INFO: 自签证书模式，无需监控"
-    exit 0
-fi
-
-if [[ -z "$SOURCE_CERT_PATH" ]] || [[ -z "$SOURCE_KEY_PATH" ]]; then
-    log "ERROR: 源路径未配置，退出监控"
-    exit 1
-fi
-
-REAL_CERT_PATH=$(readlink -f "$SOURCE_CERT_PATH" 2>/dev/null || echo "$SOURCE_CERT_PATH")
-REAL_KEY_PATH=$(readlink -f "$SOURCE_KEY_PATH" 2>/dev/null || echo "$SOURCE_KEY_PATH")
-
-CERT_DIR=$(dirname "$REAL_CERT_PATH")
-KEY_DIR=$(dirname "$REAL_KEY_PATH")
-
-ORIG_CERT_DIR=$(dirname "$SOURCE_CERT_PATH")
-ORIG_KEY_DIR=$(dirname "$SOURCE_KEY_PATH")
-
-declare -A WATCH_DIRS
-for dir in "$CERT_DIR" "$KEY_DIR" "$ORIG_CERT_DIR" "$ORIG_KEY_DIR"; do
-    if [[ -d "$dir" ]]; then
-        WATCH_DIRS["$dir"]=1
-    fi
-done
-
-if [[ ${#WATCH_DIRS[@]} -eq 0 ]]; then
-    log "ERROR: 没有可监控的目录"
-    exit 1
-fi
-
-DIRS_TO_WATCH="${!WATCH_DIRS[*]}"
-log "INFO: 开始监控目录: $DIRS_TO_WATCH"
-
-inotifywait -m -q -e close_write,moved_to,create,attrib --format '%w%f' $DIRS_TO_WATCH 2>/dev/null | while read FILE; do
-    BASENAME=$(basename "$FILE")
-    if [[ "$FILE" == "$SOURCE_CERT_PATH" ]] || [[ "$FILE" == "$SOURCE_KEY_PATH" ]] || \
-       [[ "$FILE" == "$REAL_CERT_PATH" ]] || [[ "$FILE" == "$REAL_KEY_PATH" ]] || \
-       [[ "$BASENAME" == *"fullchain"* ]] || [[ "$BASENAME" == *".crt" ]] || \
-       [[ "$BASENAME" == *".pem" ]] || [[ "$BASENAME" == *".cer" ]] || [[ "$BASENAME" == *".key" ]]; then
-        log "INFO: 检测到文件变化: $FILE"
-        sleep 3
-        /etc/hysteria/sync_cert.sh
-    fi
-done
-WATCHEOF
-    chmod +x /etc/hysteria/cert_watcher.sh
-}
-
-create_watcher_service(){
-    cat << 'EOF' > /etc/systemd/system/hysteria-cert-watcher.service
-[Unit]
-Description=Hysteria Certificate Watcher
-After=network.target
-Wants=hysteria-server.service
-
-[Service]
-Type=simple
-ExecStart=/etc/hysteria/cert_watcher.sh
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    echo -e " ${GREEN}2.${PLAIN} 使用 ACME 脚本自动申请证书 ${YELLOW}（推荐）${PLAIN}"
+    echo -e "    ${PLAIN}说明：需要你拥有一个域名。脚本会自动申请并更新证书。"
+    echo -e "          ${YELLOW}注意：请确保域名 DNS 已正确解析到本机 IP。${PLAIN}"
+    echo -e "          ${YELLOW}若使用 Cloudflare，请务必关闭代理状态（即小云朵变灰）。${PLAIN}"
+    echo ""
     
-    systemctl daemon-reload
-}
-
-create_sync_timer(){
-    cat << 'EOF' > /etc/systemd/system/hysteria-cert-sync.service
-[Unit]
-Description=Hysteria Certificate Sync
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/etc/hysteria/sync_cert.sh
-EOF
-
-    cat << 'EOF' > /etc/systemd/system/hysteria-cert-sync.timer
-[Unit]
-Description=Hysteria Certificate Sync Timer
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=5min
-AccuracySec=1min
-
-[Install]
-WantedBy=timers.target
-EOF
+    echo -e " ${GREEN}3.${PLAIN} 使用本地已有的证书文件"
+    echo -e "    ${PLAIN}说明：如果你已经拥有有效的证书文件 (crt/key)，请选择此项手动指定路径。"
+    echo ""
     
-    systemctl daemon-reload
-}
-
-setup_certbot_hook(){
-    local source_cert="$1"
+    read -rp "请输入选项 [1-3]: " certInput
     
-    if [[ "$source_cert" == *"/etc/letsencrypt/"* ]]; then
-        if command -v certbot &>/dev/null; then
-            mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-            cat << 'EOF' > /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
-#!/bin/bash
-/etc/hysteria/sync_cert.sh
-EOF
-            chmod +x /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh
-            return 0
-        fi
-    fi
-    return 1
-}
+    if [[ $certInput == 2 ]]; then
+        cert_path="/etc/hysteria/cert.crt"
+        key_path="/etc/hysteria/private.key"
+        # ACME申请的证书是受信任的，不需要跳过验证
+        insecure=0
 
-setup_acme_reloadcmd(){
-    local domain="$1"
-    local acme_home="${HOME}/.acme.sh"
-    
-    if [[ -f "$acme_home/acme.sh" ]]; then
-        local conf_file=""
-        if [[ -f "$acme_home/${domain}_ecc/${domain}.conf" ]]; then
-            conf_file="$acme_home/${domain}_ecc/${domain}.conf"
-        elif [[ -f "$acme_home/${domain}/${domain}.conf" ]]; then
-            conf_file="$acme_home/${domain}/${domain}.conf"
-        fi
-        
-        if [[ -n "$conf_file" ]]; then
-            if ! grep -q "hysteria" "$conf_file" 2>/dev/null; then
-                bash "$acme_home/acme.sh" --install-cert -d "$domain" \
-                    --reloadcmd "/etc/hysteria/sync_cert.sh" \
-                    --ecc 2>/dev/null || true
+        if [[ -f $cert_path && -f $key_path && -s $cert_path && -s $key_path ]] && [[ -f /root/ca.log ]]; then
+            domain=$(cat /root/ca.log)
+            green "检测到原有域名：$domain 的证书，正在应用"
+            hy_domain=$domain
+        else
+            WARPv4Status=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+            WARPv6Status=$(curl -s6m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+            if [[ $WARPv4Status =~ on|plus ]] || [[ $WARPv6Status =~ on|plus ]]; then
+                wg-quick down wgcf >/dev/null 2>&1
+                systemctl stop warp-go >/dev/null 2>&1
+                realip
+                wg-quick up wgcf >/dev/null 2>&1
+                systemctl start warp-go >/dev/null 2>&1
+            else
+                realip
+            fi
+            
+            read -p "请输入需要申请证书的域名：" domain
+            [[ -z $domain ]] && red "未输入域名，无法执行操作！" && exit 1
+            green "已输入的域名：$domain" && sleep 1
+            
+            ${PACKAGE_INSTALL[int]} curl wget sudo socat openssl
+            if [[ $SYSTEM == "CentOS" ]]; then
+                ${PACKAGE_INSTALL[int]} cronie
+                systemctl start crond
+                systemctl enable crond
+            else
+                ${PACKAGE_INSTALL[int]} cron
+                systemctl start cron
+                systemctl enable cron
+            fi
+            
+            curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
+            source ~/.bashrc
+            bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade
+            bash ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+            
+            if [[ -n $(echo $ip | grep ":") ]]; then
+                bash ~/.acme.sh/acme.sh --issue -d ${domain} --standalone -k ec-256 --listen-v6 --insecure
+            else
+                bash ~/.acme.sh/acme.sh --issue -d ${domain} --standalone -k ec-256 --insecure
+            fi
+            
+            bash ~/.acme.sh/acme.sh --install-cert -d ${domain} --key-file /etc/hysteria/private.key --fullchain-file /etc/hysteria/cert.crt --ecc
+            
+            if [[ -f /etc/hysteria/cert.crt && -f /etc/hysteria/private.key ]] && [[ -s /etc/hysteria/cert.crt && -s /etc/hysteria/private.key ]]; then
+                echo $domain > /root/ca.log
+                sed -i '/--cron/d' /etc/crontab >/dev/null 2>&1
+                echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
+                
+                green "证书申请成功!"
+                hy_domain=$domain
+            else
+                red "证书申请失败！"
+                exit 1
             fi
         fi
-    fi
-}
-
-setup_cert_monitoring(){
-    local source_cert="$1"
-    local source_key="$2"
-    
-    yellow "正在配置证书自动同步功能..."
-    
-    create_cert_sync_script
-    
-    local has_inotify=0
-    if command -v inotifywait &>/dev/null; then
-        has_inotify=1
-    else
-        yellow "正在安装实时监控工具 (inotify-tools)..."
-        ${PACKAGE_INSTALL[int]} inotify-tools 2>/dev/null
-        if command -v inotifywait &>/dev/null; then
-            has_inotify=1
-        fi
-    fi
-    
-    if [[ $has_inotify -eq 1 ]]; then
-        green "✓ 已启用实时监控模式"
-        create_cert_watcher_script
-        create_watcher_service
+    elif [[ $certInput == 3 ]]; then
+        read -p "请输入公钥文件 crt 的路径：" cert_path
+        read -p "请输入密钥文件 key 的路径：" key_path
+        read -p "请输入证书的域名：" domain
         
-        systemctl stop hysteria-cert-watcher 2>/dev/null
-        systemctl disable hysteria-cert-watcher 2>/dev/null
+        if [[ ! -f $cert_path ]]; then
+            red "证书文件不存在：$cert_path"
+            exit 1
+        fi
+        if [[ ! -f $key_path ]]; then
+            red "密钥文件不存在：$key_path"
+            exit 1
+        fi
         
-        systemctl enable hysteria-cert-watcher
-        systemctl start hysteria-cert-watcher
+        # 获取真实路径（处理符号链接，如 certbot 的证书）
+        real_cert_path=$(readlink -f "$cert_path")
+        real_key_path=$(readlink -f "$key_path")
         
-        if systemctl is-active hysteria-cert-watcher &>/dev/null; then
-            green "✓ 实时监控服务已运行"
-        else
-            yellow "⚠ 监控服务启动异常，将转为定时检查"
+        # 授予 hysteria 用户读取证书文件的权限
+        # 给证书文件添加其他用户可读权限
+        chmod o+r "$real_cert_path" 2>/dev/null
+        chmod o+r "$real_key_path" 2>/dev/null
+        
+        # 确保目录路径可以被遍历（给每一级目录添加 o+x 权限）
+        cert_dir=$(dirname "$real_cert_path")
+        key_dir=$(dirname "$real_key_path")
+        
+        # 处理证书目录路径
+        current_path=""
+        IFS='/' read -ra path_parts <<< "$cert_dir"
+        for part in "${path_parts[@]}"; do
+            [[ -z "$part" ]] && continue
+            current_path="$current_path/$part"
+            chmod o+x "$current_path" 2>/dev/null
+        done
+        
+        # 处理密钥目录路径（如果与证书目录不同）
+        if [[ "$key_dir" != "$cert_dir" ]]; then
+            current_path=""
+            IFS='/' read -ra path_parts <<< "$key_dir"
+            for part in "${path_parts[@]}"; do
+                [[ -z "$part" ]] && continue
+                current_path="$current_path/$part"
+                chmod o+x "$current_path" 2>/dev/null
+            done
         fi
+        
+        hy_domain=$domain
+        # 用户提供的证书默认是受信任的，不需要跳过验证
+        insecure=0
+        
+        green "已授予 Hysteria 读取证书文件的权限"
     else
-        yellow "⚠ 未找到实时监控工具，将使用定时检查（每5分钟）"
+        green "将使用必应自签证书作为 Hysteria 2 的节点证书"
+        
+        cert_path="/etc/hysteria/cert.crt"
+        key_path="/etc/hysteria/private.key"
+        openssl ecparam -genkey -name prime256v1 -out /etc/hysteria/private.key
+        openssl req -new -x509 -days 36500 -key /etc/hysteria/private.key -out /etc/hysteria/cert.crt -subj "/CN=www.bing.com"
+        hy_domain="www.bing.com"
+        domain="www.bing.com"
+        # 自签证书需要跳过验证
+        insecure=1
     fi
-    
-    create_sync_timer
-    systemctl enable hysteria-cert-sync.timer
-    systemctl start hysteria-cert-sync.timer
-    green "✓ 定时同步任务已启动"
-    
-    if setup_certbot_hook "$source_cert"; then
-        green "✓ 已配置 Certbot 自动同步钩子"
-    fi
-    
-    sed -i '/hysteria.*sync_cert/d' /etc/crontab 2>/dev/null
-    crontab -l 2>/dev/null | grep -v "hysteria.*sync_cert" | crontab - 2>/dev/null
-    
-    echo ""
-    green "证书同步系统配置完毕！"
-}
-
-stop_cert_monitoring(){
-    systemctl stop hysteria-cert-watcher 2>/dev/null
-    systemctl disable hysteria-cert-watcher 2>/dev/null
-    systemctl stop hysteria-cert-sync.timer 2>/dev/null
-    systemctl disable hysteria-cert-sync.timer 2>/dev/null
-    rm -f /etc/systemd/system/hysteria-cert-watcher.service
-    rm -f /etc/systemd/system/hysteria-cert-sync.service
-    rm -f /etc/systemd/system/hysteria-cert-sync.timer
-    systemctl daemon-reload
-    
-    rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh 2>/dev/null
-    sed -i '/hysteria.*sync_cert/d' /etc/crontab 2>/dev/null
-    
-    rm -f /etc/hysteria/sync_cert.sh
-    rm -f /etc/hysteria/cert_watcher.sh
-    rm -f /etc/hysteria/sync_cert.log
-    rm -f /etc/hysteria/cert_source.conf
-    rm -f /root/ca.log
-}
-
-get_acme_cert_paths(){
-    local domain="$1"
-    local acme_home=""
-    
-    if [[ -d "${HOME}/.acme.sh" ]]; then
-        acme_home="${HOME}/.acme.sh"
-    elif [[ -d "/root/.acme.sh" ]]; then
-        acme_home="/root/.acme.sh"
-    else
-        return 1
-    fi
-    
-    local ecc_dir="${acme_home}/${domain}_ecc"
-    if [[ -d "$ecc_dir" ]]; then
-        local cert_file="${ecc_dir}/fullchain.cer"
-        local key_file="${ecc_dir}/${domain}.key"
-        if [[ -f "$cert_file" && -f "$key_file" ]]; then
-            echo "$cert_file|$key_file"
-            return 0
-        fi
-    fi
-    
-    local rsa_dir="${acme_home}/${domain}"
-    if [[ -d "$rsa_dir" ]]; then
-        local cert_file="${rsa_dir}/fullchain.cer"
-        local key_file="${rsa_dir}/${domain}.key"
-        if [[ -f "$cert_file" && -f "$key_file" ]]; then
-            echo "$cert_file|$key_file"
-            return 0
-        fi
-    fi
-    
-    return 1
-}
-
-check_port_in_use(){
-    local port=$1
-    if ss -tunlp 2>/dev/null | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -qw "$port"; then
-        return 0
-    fi
-    return 1
 }
 
 inst_port_config(){
@@ -590,28 +272,21 @@ inst_port_config(){
     ip6tables -t nat -F PREROUTING >/dev/null 2>&1
     
     echo ""
-    green "请选择端口模式："
-    echo -e " ${GREEN}1.${PLAIN} 端口跳跃 (抗封锁，推荐)"
+    green "请选择端口使用模式："
+    echo -e " ${GREEN}1.${PLAIN} 端口跳跃 (Port Hopping) ${YELLOW}（默认，强烈推荐）${PLAIN}"
+    echo -e "    ${PLAIN}说明：自动在多个端口间切换，有效对抗运营商针对性阻断和限速，连接更稳。"
     echo -e " ${GREEN}2.${PLAIN} 单端口模式"
     echo ""
     read -rp "请输入选项 [1-2]: " portMode
     
     if [[ $portMode == 2 ]]; then
-        while true; do
-            read -p "请输入运行端口 (1-65535) [回车随机]: " port
+        read -p "设置 Hysteria 2 端口 [1-65535]（回车随机 2000-65535）：" port
+        [[ -z $port ]] && port=$(shuf -i 2000-65535 -n 1)
+        
+        until [[ -z $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]]; do
+            echo -e "${RED} $port ${PLAIN} 端口已被占用，请更换！"
+            read -p "设置 Hysteria 2 端口 [1-65535]：" port
             [[ -z $port ]] && port=$(shuf -i 2000-65535 -n 1)
-            
-            if [[ ! $port =~ ^[0-9]+$ ]] || [[ $port -lt 1 ]] || [[ $port -gt 65535 ]]; then
-                red "端口必须是 1 到 65535 之间的数字！"
-                continue
-            fi
-            
-            if check_port_in_use "$port"; then
-                red "端口 $port 已被占用，请更换！"
-                continue
-            fi
-            
-            break
         done
         
         firstport=""
@@ -622,64 +297,55 @@ inst_port_config(){
         ip6tables -I INPUT -p udp --dport $port -j ACCEPT
         save_iptables_rules
         
-        yellow "将运行在单端口：$port"
+        yellow "Hysteria 2 将运行在单端口：$port"
         
     else
-        green "已启用端口跳跃模式"
+        green "已选择端口跳跃模式。"
+        yellow "注意：请仔细检查服务器是否存在端口冲突（如Web服务的80/443等）。"
+        yellow "推荐：结束端口与起始端口的差值建议在 100 以内。"
         echo ""
         
-        while true; do
-            read -p "请输入起始端口 [建议 20000 以上] (回车随机): " firstport
+        read -p "请输入起始端口/主端口 [建议2500-10000] (回车随机生成): " firstport
+        if [[ -z $firstport ]]; then
+            firstport=$(shuf -i 2500-10000 -n 1)
+        fi
+        
+        until [[ -z $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$firstport") ]]; do
+            echo -e "${RED} $firstport ${PLAIN} 端口已被占用，请更换！"
+            read -p "请输入起始端口/主端口：" firstport
             [[ -z $firstport ]] && firstport=$(shuf -i 2500-10000 -n 1)
-            
-            if [[ ! $firstport =~ ^[0-9]+$ ]] || [[ $firstport -lt 1 ]] || [[ $firstport -gt 65535 ]]; then
-                red "请输入有效的数字端口！"
-                continue
-            fi
-            
-            if check_port_in_use "$firstport"; then
-                red "起始端口 $firstport 已被占用，请更换！"
-                continue
-            fi
-            
-            break
         done
         
+        default_endport=$((firstport + 75))
+        read -p "请输入结束端口 (回车默认为 起始端口+75 -> $default_endport): " endport
+        [[ -z $endport ]] && endport=$default_endport
+
+        # 添加数字验证和空值处理
         while true; do
-            default_endport=$((firstport + 75))
-            [[ $default_endport -gt 65535 ]] && default_endport=65535
-            read -p "请输入结束端口 (回车默认 $default_endport): " endport
-            [[ -z $endport ]] && endport=$default_endport
-            
-            if [[ ! $endport =~ ^[0-9]+$ ]] || [[ $endport -lt 1 ]] || [[ $endport -gt 65535 ]]; then
-                red "请输入有效的数字端口！"
+            if [[ ! $firstport =~ ^[0-9]+$ ]] || [[ ! $endport =~ ^[0-9]+$ ]]; then
+                red "端口必须是数字！"
+                read -p "请重新输入起始端口：" firstport
+                [[ -z $firstport ]] && firstport=$(shuf -i 2500-10000 -n 1)
+                read -p "请重新输入结束端口：" endport
+                [[ -z $endport ]] && endport=$((firstport + 75))
                 continue
             fi
             
             if [[ $firstport -ge $endport ]]; then
                 red "起始端口必须小于结束端口！"
-                continue
-            fi
-            
-            local conflict_port=""
-            for ((p=firstport; p<=endport; p++)); do
-                if check_port_in_use "$p"; then
-                    conflict_port=$p
-                    break
-                fi
-            done
-            
-            if [[ -n $conflict_port ]]; then
-                red "范围内的端口 $conflict_port 已被占用，请调整范围！"
+                read -p "请重新输入起始端口：" firstport
+                [[ -z $firstport ]] && firstport=$(shuf -i 2500-10000 -n 1)
+                read -p "请重新输入结束端口：" endport
+                [[ -z $endport ]] && endport=$((firstport + 75))
                 continue
             fi
             
             break
         done
         
-        read -p "跳跃间隔秒数 [默认 25s]: " hop_interval
+        # 设置端口跳跃间隔
+        read -p "请输入端口跳跃间隔秒数 [默认25]: " hop_interval
         [[ -z $hop_interval ]] && hop_interval=25
-        [[ ! $hop_interval =~ ^[0-9]+$ ]] && hop_interval=25
         
         port=$firstport
         
@@ -690,56 +356,65 @@ inst_port_config(){
         ip6tables -I INPUT -p udp --dport $firstport:$endport -j ACCEPT
         save_iptables_rules
         
-        yellow "跳跃范围：$firstport - $endport (主端口: $port, 间隔: ${hop_interval}s)"
+        yellow "端口跳跃设置完成：$firstport - $endport (主监听端口: $port, 跳跃间隔: ${hop_interval}s)"
     fi
 }
 
 inst_pwd(){
-    read -p "请设置连接密码（直接回车随机生成）：" auth_pwd
+    read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" auth_pwd
     [[ -z $auth_pwd ]] && auth_pwd=$(date +%s%N | md5sum | cut -c 1-8)
-    yellow "密码已设置为：$auth_pwd"
+    yellow "使用在 Hysteria 2 节点的密码为：$auth_pwd"
 }
 
 inst_site(){
     echo ""
-    green "请选择伪装页面："
-    echo -e " ${GREEN}1.${PLAIN} 模拟网站不存在 (403 Forbidden) ${YELLOW}（最快，推荐）${PLAIN}"
-    echo -e " ${GREEN}2.${PLAIN} 伪装成其他网站 (Proxy)"
+    green "设置 Hysteria 2 伪装形式："
+    
+    echo -e " ${GREEN}1.${PLAIN} 返回 403 Forbidden 页面 ${YELLOW}（默认，强烈推荐）${PLAIN}"
+    echo -e "    ${PLAIN}说明：模拟 Nginx 私有服务器拒绝访问。${GREEN}性能最优，CPU占用最低，隐蔽性极佳。${PLAIN}"
     echo ""
+    
+    echo -e " ${GREEN}2.${PLAIN} 伪装成其他网页 (Proxy 模式)"
+    echo -e "    ${PLAIN}说明：反代目标网站。${RED}不推荐！会消耗额外 CPU/带宽，容易被识别为跳板攻击，伪装效果往往不如静态页面。${PLAIN}"
+    echo ""
+    
     read -rp "请输入选项 [1-2]: " masqInput
     
     if [[ $masqInput == 2 ]]; then
         masq_type="proxy"
-        read -rp "请输入要伪装的目标域名（不带 https://）[默认首尔大学]：" proxysite
+        read -rp "请输入 Hysteria 2 的伪装网站地址 （去除https://） [默认首尔大学]：" proxysite
         [[ -z $proxysite ]] && proxysite="en.snu.ac.kr"
-        yellow "已设置为伪装：$proxysite"
+        yellow "Hysteria 2 将伪装成：$proxysite (性能较低)"
     else
         masq_type="string"
         proxysite=""
-        green "已选择 403 伪装模式"
+        green "Hysteria 2 将使用 403 Forbidden 页面作为伪装 (性能最优)"
     fi
 }
 
 inst_bandwidth(){
     echo ""
-    green "是否限制服务器带宽？(建议限制以防被运营商检测)："
-    echo -e " ${GREEN}1.${PLAIN} 限制为 100 Mbps ${YELLOW}（推荐）${PLAIN}"
-    echo -e " ${GREEN}2.${PLAIN} 不限制速度"
+    green "设置服务端带宽限制 (速度限制)："
+    echo -e " ${GREEN}1.${PLAIN} 开启 100 Mbps 限制 ${YELLOW}（默认，推荐）${PLAIN}"
+    echo -e "    ${PLAIN}说明：${GREEN}100M 对于 4K 视频绰绰有余。${PLAIN}保持带宽克制能显著降低被运营商QoS(限速)或阻断的风险，使连接更持久稳定。"
+    echo -e " ${GREEN}2.${PLAIN} 不限制带宽 (不推荐)"
     echo ""
+    
     read -rp "请输入选项 [1-2]: " bwInput
     
     if [[ $bwInput == 2 ]]; then
         limit_bandwidth="no"
         bandwidth_value=""
+        yellow "已选择：不限制带宽"
     else
         limit_bandwidth="yes"
         bandwidth_value="100"
+        yellow "已选择：限制服务端带宽为 100 Mbps (上下行)"
     fi
 }
 
 generate_config(){
     mkdir -p /etc/hysteria
-    local yaml_pwd=$(escape_yaml_string "$auth_pwd")
 
     cat << EOF > /etc/hysteria/config.yaml
 listen: :$port
@@ -756,7 +431,7 @@ quic:
 
 auth:
   type: password
-  password: $yaml_pwd
+  password: "$auth_pwd"
 
 EOF
 
@@ -807,6 +482,7 @@ generate_client_config(){
         last_ip=$ip
     fi
 
+    # 根据 insecure 变量设置布尔值
     if [[ $insecure == 1 ]]; then
         insecure_bool="true"
     else
@@ -814,12 +490,12 @@ generate_client_config(){
     fi
 
     mkdir -p /root/hy
-    local yaml_pwd=$(escape_yaml_string "$auth_pwd")
     
+    # 生成 YAML 客户端配置
     cat << EOF > /root/hy/hy-client.yaml
 server: $last_ip:$server_port_string
 
-auth: $yaml_pwd
+auth: $auth_pwd
 
 tls:
   sni: $hy_domain
@@ -838,6 +514,7 @@ socks5:
 
 EOF
 
+    # 仅在端口跳跃模式下添加 transport 配置
     if [[ -n $firstport && -n $endport ]]; then
         cat << EOF >> /root/hy/hy-client.yaml
 transport:
@@ -846,13 +523,12 @@ transport:
 EOF
     fi
     
-    local json_pwd=$(escape_json_string "$auth_pwd")
-    
+    # 生成 JSON 配置
     if [[ -n $firstport && -n $endport ]]; then
         cat << EOF > /root/hy/hy-client.json
 {
   "server": "$last_ip:$server_port_string",
-  "auth": "$json_pwd",
+  "auth": "$auth_pwd",
   "tls": {
     "sni": "$hy_domain",
     "insecure": $insecure_bool
@@ -877,7 +553,7 @@ EOF
         cat << EOF > /root/hy/hy-client.json
 {
   "server": "$last_ip:$server_port_string",
-  "auth": "$json_pwd",
+  "auth": "$auth_pwd",
   "tls": {
     "sni": "$hy_domain",
     "insecure": $insecure_bool
@@ -895,11 +571,15 @@ EOF
 EOF
     fi
 
+    # URL编码密码
     encoded_pwd=$(urlencode "$auth_pwd")
     
+    # 生成订阅链接 - 按照标准格式
     if [[ -n $firstport && -n $endport ]]; then
+        # 端口跳跃模式
         url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&mportHopInt=${hop_interval:-25}&insecure=${insecure}&mport=${firstport}-${endport}&sni=${hy_domain}#Hysteria2"
     else
+        # 单端口模式
         url="hysteria2://${encoded_pwd}@${last_ip}:${port}?security=tls&insecure=${insecure}&sni=${hy_domain}#Hysteria2"
     fi
     
@@ -908,10 +588,11 @@ EOF
 
 read_current_config(){
     if [[ -f /etc/hysteria/config.yaml ]]; then
+        # 更准确的端口解析
         port=$(grep "^listen:" /etc/hysteria/config.yaml | sed 's/listen://g' | sed 's/[[:space:]]//g' | sed 's/\[.*\]//g' | sed 's/://g')
         cert_path=$(grep "cert:" /etc/hysteria/config.yaml | awk '{print $2}')
         key_path=$(grep "key:" /etc/hysteria/config.yaml | awk '{print $2}')
-        auth_pwd=$(grep "password:" /etc/hysteria/config.yaml | sed 's/.*password:[[:space:]]*//' | sed 's/^"//' | sed 's/"$//' | sed "s/^'//" | sed "s/'$//")
+        auth_pwd=$(grep "password:" /etc/hysteria/config.yaml | awk '{print $2}' | sed 's/"//g')
         
         if grep -q "type: proxy" /etc/hysteria/config.yaml; then
             masq_type="proxy"
@@ -929,22 +610,33 @@ read_current_config(){
             bandwidth_value=""
         fi
         
-        if read_cert_config; then
-            hy_domain="$CERT_DOMAIN"
-            [[ "$CERT_MODE" == "selfsigned" ]] && insecure=1 || insecure=0
-        elif [[ -f /root/hy/hy-client.yaml ]]; then
+        if [[ -f /root/hy/hy-client.yaml ]]; then
             hy_domain=$(grep "sni:" /root/hy/hy-client.yaml | awk '{print $2}')
-            [[ $(grep "insecure:" /root/hy/hy-client.yaml | awk '{print $2}') == "true" ]] && insecure=1 || insecure=0
+            # 读取跳跃间隔
+            hop_interval=$(grep "hopInterval:" /root/hy/hy-client.yaml | awk '{print $2}' | sed 's/s$//')
+            # 读取 insecure 设置
+            insecure_value=$(grep "insecure:" /root/hy/hy-client.yaml | awk '{print $2}')
+            if [[ $insecure_value == "true" ]]; then
+                insecure=1
+            else
+                insecure=0
+            fi
         else
-            hy_domain=$(get_cert_primary_domain "$cert_path")
+            hy_domain=$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN = //;s/,.*//' | sed 's/.*CN=//;s/,.*//')
             [[ -z $hy_domain ]] && hy_domain="www.bing.com"
-            [[ $hy_domain == "www.bing.com" ]] && insecure=1 || insecure=0
+            hop_interval=25
+            # 如果是 bing.com 则认为是自签证书
+            if [[ $hy_domain == "www.bing.com" ]]; then
+                insecure=1
+            else
+                insecure=0
+            fi
         fi
         
-        [[ -f /root/hy/hy-client.yaml ]] && hop_interval=$(grep "hopInterval:" /root/hy/hy-client.yaml | awk '{print $2}' | sed 's/s$//') || hop_interval=25
-        
+        # 使用兼容的方式检测端口跳跃规则
         port_hop_rule=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep "dpts:" | head -1)
         if [[ -n $port_hop_rule ]]; then
+            # 提取端口范围，如 "dpts:2500:2575"
             port_range=$(echo "$port_hop_rule" | grep -o 'dpts:[0-9]*:[0-9]*' | sed 's/dpts://')
             if [[ -n $port_range ]]; then
                 firstport=$(echo "$port_range" | cut -d: -f1)
@@ -1006,33 +698,35 @@ insthysteria(){
     systemctl daemon-reload
     systemctl enable hysteria-server
     
-    sleep 3
+    echo "正在等待网络环境就绪..."
+    sleep 5
     systemctl start hysteria-server
     
-    [[ ! -f /usr/bin/hy2 ]] && cp -f "$0" /usr/bin/hy2 && chmod +x /usr/bin/hy2
+    if [[ ! -f /usr/bin/hy2 ]]; then
+        cp -f "$0" /usr/bin/hy2
+        chmod +x /usr/bin/hy2
+    fi
 
     sleep 2
-    if [[ -n $(systemctl status hysteria-server 2>/dev/null | grep -w active) ]]; then
+    if [[ -n $(systemctl status hysteria-server 2>/dev/null | grep -w active) && -f '/etc/hysteria/config.yaml' ]]; then
         green "Hysteria 2 服务启动成功"
     else
-        red "启动失败，请查看日志：journalctl -u hysteria-server -e" && exit 1
+        red "Hysteria 2 服务启动失败，请检查日志：journalctl -u hysteria-server -e" && exit 1
     fi
+    red "======================================================================================"
+    green "Hysteria 2 代理服务安装完成"
     
-    echo ""
-    green "====================================="
-    green "  Hysteria 2 安装完成！"
-    green "  管理命令：hy2"
-    green "====================================="
-    echo ""
+    green "======================================================================================"
+    green "               管理命令：${YELLOW}hy2${GREEN} (直接输入 hy2 即可)"
+    green "        输入 ${YELLOW}hy2${GREEN} 即可再次召唤本主界面，进行配置管理"
+    green "======================================================================================"
     
-    yellow "客户端 YAML 配置："
-    cat /root/hy/hy-client.yaml
-    echo ""
-    yellow "客户端 JSON 配置："
-    cat /root/hy/hy-client.json
-    echo ""
-    yellow "分享链接："
-    cat /root/hy/url.txt
+    yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下"
+    red "$(cat /root/hy/hy-client.yaml)"
+    yellow "Hysteria 2 客户端 JSON 配置文件 hy-client.json 内容如下"
+    red "$(cat /root/hy/hy-client.json)"
+    yellow "Hysteria 2 节点分享链接如下"
+    red "$(cat /root/hy/url.txt)"
 }
 
 unsthysteria(){
@@ -1042,40 +736,37 @@ unsthysteria(){
     rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
     rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy /root/hysteria.sh
     rm -f /usr/bin/hy2
-    rm -f /root/ca.log
-    
-    stop_cert_monitoring
-    
     iptables -t nat -F PREROUTING >/dev/null 2>&1
     ip6tables -t nat -F PREROUTING >/dev/null 2>&1
     save_iptables_rules
     systemctl daemon-reload
-    
-    green "Hysteria 2 已卸载！"
-    echo ""
-    yellow "重要说明："
-    echo "  • acme.sh 配置未受影响，所有域名证书正常续期"
-    echo "  • certbot 配置未受影响，所有域名证书正常续期"
-    echo "  • 如需删除证书，请手动操作 acme.sh 或 certbot"
+    green "Hysteria 2 已彻底卸载完成！"
 }
 
 starthysteria(){
     systemctl start hysteria-server
     systemctl enable hysteria-server >/dev/null 2>&1
-    [[ -n $(systemctl status hysteria-server 2>/dev/null | grep -w active) ]] && green "启动成功" || red "启动失败"
+    if [[ -n $(systemctl status hysteria-server 2>/dev/null | grep -w active) ]]; then
+        green "Hysteria 2 启动成功"
+    else
+        red "Hysteria 2 启动失败，请查看日志：journalctl -u hysteria-server -e"
+    fi
 }
 
 stophysteria(){
     systemctl stop hysteria-server
     systemctl disable hysteria-server >/dev/null 2>&1
-    green "已停止"
+    green "Hysteria 2 已停止"
 }
 
 hysteriaswitch(){
-    echo -e " ${GREEN}1.${PLAIN} 启动"
-    echo -e " ${GREEN}2.${PLAIN} 停止"
-    echo -e " ${GREEN}3.${PLAIN} 重启"
-    read -rp "选项 [1-3]: " switchInput
+    yellow "请选择你需要的操作："
+    echo ""
+    echo -e " ${GREEN}1.${PLAIN} 启动 Hysteria 2"
+    echo -e " ${GREEN}2.${PLAIN} 关闭 Hysteria 2"
+    echo -e " ${GREEN}3.${PLAIN} 重启 Hysteria 2"
+    echo ""
+    read -rp "请输入选项 [1-3]: " switchInput
     case $switchInput in
         1 ) starthysteria ;;
         2 ) stophysteria ;;
@@ -1085,187 +776,127 @@ hysteriaswitch(){
 }
 
 changebandwidth(){
-    read_current_config || { red "未安装"; return 1; }
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
     
-    echo -e " ${GREEN}1.${PLAIN} 限制 100 Mbps"
-    echo -e " ${GREEN}2.${PLAIN} 自定义"
-    echo -e " ${GREEN}3.${PLAIN} 不限制"
-    read -rp "选项 [1-3]: " bwChange
+    echo ""
+    green "请选择是否开启带宽限速 (推荐开启以防止阻断)："
+    echo -e " ${GREEN}1.${PLAIN} 开启 100 Mbps 限制"
+    echo -e " ${GREEN}2.${PLAIN} 自定义限速数值"
+    echo -e " ${GREEN}3.${PLAIN} 关闭限速 (不限制)"
+    echo ""
+    read -rp "请输入选项 [1-3]: " bwChange
     
-    case $bwChange in
-        1 ) limit_bandwidth="yes"; bandwidth_value="100" ;;
-        2 ) read -p "限速 (mbps): " custBw; limit_bandwidth="yes"; bandwidth_value="${custBw:-100}" ;;
-        * ) limit_bandwidth="no"; bandwidth_value="" ;;
-    esac
+    if [[ $bwChange == 1 ]]; then
+        limit_bandwidth="yes"
+        bandwidth_value="100"
+        yellow "已设置为：100 Mbps 限速"
+    elif [[ $bwChange == 2 ]]; then
+        read -p "请输入限速数值 (单位 mbps，例如 50): " custBw
+        [[ -z $custBw ]] && custBw=100
+        limit_bandwidth="yes"
+        bandwidth_value="$custBw"
+        yellow "已设置为：$custBw Mbps 限速"
+    else
+        limit_bandwidth="no"
+        bandwidth_value=""
+        yellow "已关闭带宽限制"
+    fi
 
     generate_config
     fix_permissions
     stophysteria && starthysteria
-    green "配置已更新！"
+    green "带宽限制配置已更新！"
 }
 
 changeport(){
-    read_current_config || { red "未安装"; return 1; }
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
     inst_port_config
     generate_config
     generate_client_config
     fix_permissions
     stophysteria && starthysteria
-    green "端口已更新！"
+    green "Hysteria 2 端口配置已更新！"
     showconf
 }
 
 changepasswd(){
-    read_current_config || { red "未安装"; return 1; }
-    read -p "新密码（回车随机）：" new_pwd
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
+    read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" new_pwd
     [[ -z $new_pwd ]] && new_pwd=$(date +%s%N | md5sum | cut -c 1-8)
     auth_pwd=$new_pwd
     generate_config
     generate_client_config
     fix_permissions
     stophysteria && starthysteria
-    green "密码已修改为：$auth_pwd"
+    green "Hysteria 2 节点密码已成功修改为：$auth_pwd"
     showconf
 }
 
 change_cert(){
-    read_current_config || { red "未安装"; return 1; }
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
     inst_cert
     generate_config
     generate_client_config
     fix_permissions
     stophysteria && starthysteria
-    green "证书已修改"
+    green "Hysteria 2 节点证书类型已成功修改"
     showconf
 }
 
 changeproxysite(){
-    read_current_config || { red "未安装"; return 1; }
+    if ! read_current_config; then
+        red "未找到配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
     inst_site
     generate_config
     fix_permissions
     stophysteria && starthysteria
-    green "伪装已修改！"
-}
-
-sync_cert_now(){
-    [[ ! -f /etc/hysteria/sync_cert.sh ]] && { red "同步脚本不存在"; return 1; }
-    read_cert_config && [[ "$CERT_MODE" == "selfsigned" ]] && { yellow "自签证书无需同步"; return 0; }
-    
-    yellow "正在同步..."
-    bash /etc/hysteria/sync_cert.sh
-    [[ $? -eq 0 ]] && green "同步完成！" || red "同步失败，查看日志：/etc/hysteria/sync_cert.log"
-}
-
-show_cert_status(){
-    echo ""
-    yellow "==================== 证书状态 ===================="
-    
-    if read_cert_config; then
-        echo -e "证书模式：${GREEN}$CERT_MODE${PLAIN}"
-        echo -e "配置域名：${GREEN}$CERT_DOMAIN${PLAIN}"
-        
-        if [[ -n "$SOURCE_CERT_PATH" ]]; then
-            echo ""
-            echo "源证书路径：$SOURCE_CERT_PATH"
-            local real_path=$(readlink -f "$SOURCE_CERT_PATH" 2>/dev/null)
-            if [[ "$real_path" != "$SOURCE_CERT_PATH" ]] && [[ -n "$real_path" ]]; then
-                echo "  └─ 实际路径：$real_path"
-            fi
-            if [[ -f "$SOURCE_CERT_PATH" ]]; then
-                echo -e "源证书到期：${GREEN}$(openssl x509 -in "$SOURCE_CERT_PATH" -noout -enddate 2>/dev/null | cut -d= -f2)${PLAIN}"
-            else
-                echo -e "源证书：${RED}文件不存在！${PLAIN}"
-            fi
-        fi
-        
-        echo ""
-        echo "--- Hysteria 使用的证书 ---"
-        if [[ -f /etc/hysteria/cert.crt ]]; then
-            echo -e "证书 CN：${GREEN}$(get_cert_primary_domain /etc/hysteria/cert.crt)${PLAIN}"
-            echo -e "到期时间：${GREEN}$(openssl x509 -in /etc/hysteria/cert.crt -noout -enddate 2>/dev/null | cut -d= -f2)${PLAIN}"
-        fi
-        
-        if [[ "$CERT_MODE" != "selfsigned" ]]; then
-            echo ""
-            echo "--- 同步服务状态 ---"
-            
-            if systemctl is-active hysteria-cert-watcher &>/dev/null; then
-                echo -e "${GREEN}✓ inotify 实时监控运行中${PLAIN}"
-            else
-                echo -e "${YELLOW}⚠ inotify 实时监控未运行${PLAIN}"
-            fi
-            
-            if systemctl is-active hysteria-cert-sync.timer &>/dev/null; then
-                echo -e "${GREEN}✓ 定时同步任务运行中（每5分钟）${PLAIN}"
-            fi
-            
-            if [[ -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-sync.sh ]]; then
-                echo -e "${GREEN}✓ Certbot 续期钩子已配置${PLAIN}"
-            fi
-            
-            if [[ -f /etc/hysteria/sync_cert.log ]]; then
-                echo ""
-                echo "--- 最近同步日志 ---"
-                tail -5 /etc/hysteria/sync_cert.log 2>/dev/null
-            fi
-        fi
-        
-        echo ""
-        echo "--- 证书续期说明 ---"
-        case "$CERT_MODE" in
-            acme)
-                echo "  • acme.sh 独立管理此证书的续期"
-                echo "  • 续期由 acme.sh 的 cron 任务自动执行"
-                echo "  • 此脚本仅负责同步，不干预续期"
-                ;;
-            external)
-                echo "  • 源证书由原管理工具续期"
-                echo "  • 此脚本检测到更新后自动同步"
-                ;;
-            selfsigned)
-                echo "  • 自签证书有效期100年，无需续期"
-                ;;
-        esac
-    else
-        yellow "未找到证书配置"
-    fi
-    
-    echo "=================================================="
+    green "Hysteria 2 节点伪装形式已修改成功！"
 }
 
 changeconf(){
-    green "配置变更："
-    echo -e " ${GREEN}1.${PLAIN} 修改端口"
+    green "Hysteria 2 配置变更选择如下:"
+    echo -e " ${GREEN}1.${PLAIN} 修改端口 (重新配置)"
     echo -e " ${GREEN}2.${PLAIN} 修改密码"
-    echo -e " ${GREEN}3.${PLAIN} 修改证书"
-    echo -e " ${GREEN}4.${PLAIN} 修改伪装"
-    echo -e " ${GREEN}5.${PLAIN} 修改带宽"
-    echo -e " ${GREEN}6.${PLAIN} 立即同步证书"
-    echo -e " ${GREEN}7.${PLAIN} 查看证书状态"
-    read -p "选项 [1-7]：" confAnswer
+    echo -e " ${GREEN}3.${PLAIN} 修改证书类型"
+    echo -e " ${GREEN}4.${PLAIN} 修改伪装形式"
+    echo -e " ${GREEN}5.${PLAIN} 编辑带宽限速"
+    echo ""
+    read -p " 请选择操作 [1-5]：" confAnswer
     case $confAnswer in
         1 ) changeport ;;
         2 ) changepasswd ;;
         3 ) change_cert ;;
         4 ) changeproxysite ;;
         5 ) changebandwidth ;;
-        6 ) sync_cert_now ;;
-        7 ) show_cert_status ;;
         * ) exit 1 ;;
     esac
 }
 
 showconf(){
-    [[ ! -f /root/hy/hy-client.yaml ]] && { red "未安装"; return 1; }
-    yellow "YAML 配置："
-    cat /root/hy/hy-client.yaml
-    echo ""
-    yellow "JSON 配置："
-    cat /root/hy/hy-client.json
-    echo ""
-    yellow "分享链接："
-    cat /root/hy/url.txt
+    if [[ ! -f /root/hy/hy-client.yaml ]]; then
+        red "未找到客户端配置文件，请先安装 Hysteria 2"
+        return 1
+    fi
+    yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下"
+    red "$(cat /root/hy/hy-client.yaml)"
+    yellow "Hysteria 2 客户端 JSON 配置文件 hy-client.json 内容如下"
+    red "$(cat /root/hy/hy-client.json)"
+    yellow "Hysteria 2 节点分享链接如下"
+    red "$(cat /root/hy/url.txt)"
 }
 
 menu() {
@@ -1274,16 +905,16 @@ menu() {
     echo -e "#                  ${GREEN}Hysteria 2 一键安装脚本${PLAIN}                  #"
     echo "#############################################################"
     echo ""
-    echo -e " ${GREEN}1.${PLAIN} 安装 Hysteria 2"
-    echo -e " ${RED}2.${PLAIN} 卸载 Hysteria 2"
+    echo -e " ${GREEN}1.${PLAIN} ${GREEN}安装 Hysteria 2${PLAIN}"
+    echo -e " ${RED}2.${PLAIN} ${RED}卸载 Hysteria 2${PLAIN}"
     echo " ------------------------------------------------------------"
-    echo -e " 3. 启动/停止/重启"
-    echo -e " 4. 修改配置"
-    echo -e " 5. 显示配置"
+    echo -e " 3. 关闭、开启、重启 Hysteria 2"
+    echo -e " 4. 修改 Hysteria 2 配置"
+    echo -e " 5. 显示 Hysteria 2 配置文件"
     echo " ------------------------------------------------------------"
-    echo -e " 0. 退出"
+    echo -e " 0. 退出脚本"
     echo ""
-    read -rp "选项 [0-5]: " menuInput
+    read -rp "请输入选项 [0-5]: " menuInput
     case $menuInput in
         1 ) insthysteria ;;
         2 ) unsthysteria ;;
